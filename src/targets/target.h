@@ -2,32 +2,37 @@
 
 #include <Arduino.h>
 
-// One shared contract each compiled-in transport method (network/serial/usb)
-// implements -- exactly one targets/*_target.cpp provides these symbols,
-// selected by which TARGET_NETWORK / TARGET_SERIAL / TARGET_USB build flag
-// the active platformio.ini env defines (see platformio.ini's env_* base
-// sections). mqtt_bridge.cpp and web_ui.cpp call these without knowing which
-// method is actually compiled in.
+// One shared contract each transport method implements. Unlike the old
+// compile-time-select-one-method firmware, network_target.cpp/
+// serial_target.cpp/usb_host_target.cpp are ALL always compiled in now, each
+// under its own unique function names (networkTarget*/serialTarget*/
+// usbHostTarget*, declared below) -- target.cpp's dispatcher implements the
+// functions in this header by switching on cfg.printerMethod at runtime and
+// calling into whichever one is selected. mqtt_bridge.cpp and web_ui.cpp
+// call these dispatcher functions without knowing which method is active.
 
 // One-shot: build a complete buffer, then transmit it. Used by the zpl/image
 // passthrough path and the web UI's test-print button.
 bool targetSend(const uint8_t* data, size_t len, String& err);
 bool targetSendString(const String& body, String& err);
 
-// Human-readable transport identifier ("network"/"serial"/"usb"), matches
-// the active env's METHOD build_flag -- used by the web UI and boot log.
+// Human-readable transport identifier, mirrors cfg.printerMethod ("network"/
+// "serial"/"usb_host", or "unconfigured" before the setup wizard is done) --
+// used by the web UI and boot log.
 const char* targetMethodName();
 
-// Called once from setup(), after loadConfig() -- lets the serial/usb
-// targets open their UART at the configured baud before the first job
-// arrives. No-op for the network target (it opens a fresh TCP connection
-// per job/stream instead).
+// Called once from setup(), after loadConfig() -- dispatches to whichever
+// method's *TargetSetup() is currently selected (letting the serial target
+// open its UART at the configured baud before the first job arrives, or the
+// usb_host target install the USB host stack). No-op if the setup wizard
+// hasn't chosen a method yet, or for the network target (it opens a fresh
+// TCP connection per job/stream instead).
 void targetSetup();
 
-// Called every loop() iteration. Only the usb_host target does anything
-// here (pumping the USB host library's event queues, which must happen
-// continuously for enumeration/transfers to make progress) -- every other
-// target implements this as an empty no-op.
+// Called every loop() iteration. Only dispatches to usb_host's *TargetLoop()
+// (pumping the USB host library's event queues, which must happen
+// continuously for enumeration/transfers to make progress) when usb_host is
+// the selected method -- every other method has nothing to pump.
 void targetLoop();
 
 // Shared byte-by-byte write loop with idle/total timeouts, for any Arduino
@@ -36,3 +41,22 @@ void targetLoop();
 // socket dropping mid-transfer, which isn't expressible via a generic
 // Print&, so it keeps its own loop.
 bool writeStreamWithTimeout(Print& out, const uint8_t* data, size_t len, size_t chunkSize, String& err);
+
+// Per-method implementations -- network_target.cpp, serial_target.cpp,
+// usb_host_target.cpp. Always compiled in; only called by target.cpp's
+// dispatcher when cfg.printerMethod selects that method. Not intended to be
+// called directly from anywhere else.
+void networkTargetSetup();
+void networkTargetLoop();
+bool networkTargetSend(const uint8_t* data, size_t len, String& err);
+bool networkTargetSendString(const String& body, String& err);
+
+void serialTargetSetup();
+void serialTargetLoop();
+bool serialTargetSend(const uint8_t* data, size_t len, String& err);
+bool serialTargetSendString(const String& body, String& err);
+
+void usbHostTargetSetup();
+void usbHostTargetLoop();
+bool usbHostTargetSend(const uint8_t* data, size_t len, String& err);
+bool usbHostTargetSendString(const String& body, String& err);

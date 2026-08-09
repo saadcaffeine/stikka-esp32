@@ -27,3 +27,15 @@ void wifiDisableFallbackAp();
 void wifiForceDisconnect();
 
 void printNetworkState(const char* reason);
+
+// Kicks off an async WiFi.scanNetworks() -- no-op if a scan is already in
+// progress. Non-blocking: results are collected on subsequent
+// wifiScanResultJson() calls (the web UI's /wifi-scan/start + poll
+// /wifi-scan/result endpoints, see web_ui.cpp), not returned here.
+void wifiStartScan();
+
+// {"status":"idle|scanning|failed|done","networks":[{"ssid","rssi","secure"},...]}
+// -- networks are de-duplicated by SSID (keeping the strongest RSSI) and
+// sorted strongest-first, skipping hidden (empty-SSID) networks. Only
+// present when status=="done".
+String wifiScanResultJson();

@@ -6,6 +6,10 @@ enum class LedEventType {
   tx,
 };
 
+// LED wiring (mode/pin/order/blink speed) is a compile-time-only property of
+// the board (see DEFAULT_LED_* build_flags in platformio.ini) -- there's
+// only one board/LED combination today, so it isn't NVS-backed or
+// web-UI-editable. setupStatusLed() is called once at boot only.
 void setupStatusLed();
 
 // Advances blink phase and paints the LED for the current state. Colors:

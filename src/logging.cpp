@@ -10,9 +10,7 @@ LogLevel pendingLogLevel = LogLevel::LOG_DEBUG;
 LineCapture lineCapture(&pendingLogLine);
 
 static bool debugUsbActive = false;
-static bool debugUartActive = false;
 static Print* debugOut = nullptr;
-static HardwareSerial debugUart(1);
 
 // Fixed-size line storage (matching shortenForLog()'s own truncation length)
 // instead of String: 120 entries reassigned forever at runtime would mean a
@@ -117,11 +115,6 @@ String shortenForLog(const String& text, size_t maxLen) {
 }
 
 static void stopDebugTransport() {
-  if (debugUartActive) {
-    debugUart.flush();
-    debugUart.end();
-    debugUartActive = false;
-  }
   if (debugUsbActive) {
     Serial.flush();
     Serial.end();
@@ -130,65 +123,22 @@ static void stopDebugTransport() {
   debugOut = nullptr;
 }
 
+// Debug output always goes out Serial, which always resolves to real UART0
+// (the board's programming-bridge port) since ARDUINO_USB_CDC_ON_BOOT=0 is
+// unconditional now (see platformio.ini) -- that port is physically
+// independent from the native USB-OTG connector the usb_host printer method
+// uses, so debug logging and usb_host printing never conflict regardless of
+// which printer method is runtime-selected.
 void applyDebugOutputSetting(bool enabled) {
   debugOutputEnabled = enabled;
-  if (!debugOutputEnabled) {
-    stopDebugTransport();
-    return;
-  }
-
-  String mode = cfg.debugOutputMode;
-  mode.toLowerCase();
-
-#if defined(TARGET_USB) || defined(USB_HOST_SHARES_DEBUG_PORT)
-  // TARGET_USB reserves the primary Serial/UART0 for the printer connection
-  // itself (see targets/usb_target.cpp) -- "usb" debug mode would conflict
-  // with it directly. TARGET_USB_HOST doesn't have that problem in general
-  // (the printer talks over real USB bulk transfers via the native OTG
-  // peripheral, entirely separate from Serial/UART0) -- except on a board
-  // like esp32-s2-saola-1 where the native USB peripheral and the discrete
-  // UART-bridge chip's "COM port" share the same physical connector/D+D-
-  // lines (see platformio.ini's USB_HOST_SHARES_DEBUG_PORT comment): once
-  // usb_host_install() claims that shared connector for host mode, "usb"
-  // debug mode has nothing left to reach a PC through either. A board
-  // without that specific hardware quirk (its usb_host and Serial/UART0
-  // ports are physically independent) doesn't define this flag and can use
-  // "usb" debug mode freely alongside usb_host.
-  // The web UI already refuses to save "usb" where this guard applies, but
-  // a value saved before a firmware update (or written directly to NVS)
-  // could still have it -- fall all the way back to disabled rather than
-  // the uart branch below silently trying "usb" again if its pins are unset.
-  if (mode == "usb") {
-    if (cfg.debugUartTxPin < 0 || cfg.debugUartRxPin < 0) {
-      debugOutputEnabled = false;
-      debugOut = nullptr;
-      return;
-    }
-    mode = "uart";
-  }
-#endif
-
   stopDebugTransport();
-  if (mode == "uart") {
-    if (cfg.debugUartTxPin < 0 || cfg.debugUartRxPin < 0) {
-      mode = "usb";
-    } else {
-      debugUart.begin(115200, SERIAL_8N1, cfg.debugUartRxPin, cfg.debugUartTxPin);
-      debugUartActive = true;
-      debugOut = &debugUart;
-      dbgPrint("[debug] UART logging enabled on TX=");
-      dbgPrint(cfg.debugUartTxPin);
-      dbgPrint(" RX=");
-      dbgPrintln(cfg.debugUartRxPin, LogLevel::LOG_INFO);
-      return;
-    }
-  }
+  if (!debugOutputEnabled) return;
 
   Serial.begin(115200);
   delay(50);
   debugUsbActive = true;
   debugOut = &Serial;
-  dbgPrintln("[debug] USB serial logging enabled", LogLevel::LOG_INFO);
+  dbgPrintln("[debug] serial logging enabled (UART0 / programming port)", LogLevel::LOG_INFO);
 }
 
 // Printing tens of KB in one blocking println() can starve the WiFi/MQTT

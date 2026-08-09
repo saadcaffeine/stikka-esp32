@@ -47,6 +47,8 @@ void loadConfig() {
   cfg.statusIntervalSec = prefs.getUShort("statInt", 30);
   cfg.printerName = prefs.getString("printer", "stikka-esp32");
   cfg.location = prefs.getString("location", "");
+  cfg.printerProtocol = prefs.getString("printProto", "");
+  cfg.printerMethod = prefs.getString("printMeth", "");
   cfg.zplTargetHost = prefs.getString("zplHost", "");
   cfg.zplTargetPort = prefs.getUShort("zplPort", 9100);
   cfg.dpi = prefs.getInt("dpi", DEFAULT_DPI);
@@ -54,27 +56,23 @@ void loadConfig() {
   cfg.labelLength = prefs.getInt("labelL", 55);
   cfg.zplCompressionSupported = prefs.getBool("zplCompr", false);
   cfg.debugOutput = prefs.getBool("dbgOut", true);
-  cfg.debugOutputMode = prefs.getString("dbgMode", DEFAULT_DEBUG_OUTPUT_MODE);
-  cfg.debugUartTxPin = prefs.getInt("dbgTx", DEFAULT_DEBUG_UART_TX_PIN);
-  cfg.debugUartRxPin = prefs.getInt("dbgRx", DEFAULT_DEBUG_UART_RX_PIN);
   cfg.printerUartTxPin = prefs.getInt("puTx", 32);
   cfg.printerUartRxPin = prefs.getInt("puRx", 33);
   cfg.printerUartBaud = prefs.getUInt("puBaud", 9600);
-  cfg.printerUsbBaud = prefs.getUInt("usbBaud", 115200);
   cfg.qlPrintheadPx = prefs.getInt("qlHeadPx", 720);
   cfg.qlInvalidateBytes = prefs.getInt("qlInval", 200);
   cfg.qlAutoCut = prefs.getBool("qlCut", true);
   cfg.qlFeedMarginDots = prefs.getInt("qlFeed", 35);
   cfg.qlRightMarginDots = prefs.getInt("qlRMarg", 0);
-  cfg.ledMode = prefs.getString("ledMode", DEFAULT_LED_MODE);
-  cfg.ledPin = prefs.getInt("ledPin", DEFAULT_LED_PIN);
-  cfg.ledPinR = prefs.getInt("ledPinR", -1);
-  cfg.ledPinG = prefs.getInt("ledPinG", -1);
-  cfg.ledPinB = prefs.getInt("ledPinB", -1);
-  cfg.ledOrder = prefs.getString("ledOrder", DEFAULT_LED_ORDER);
-  cfg.ledBlinkMs = prefs.getUShort("ledBlink", 700);
+  cfg.seikoMaxDots = prefs.getInt("seikoDots", 576);
+  cfg.seikoDensity = prefs.getInt("seikoDens", 0x00);
+  cfg.seikoSpeed = prefs.getInt("seikoSpd", 0x02);
   cfg.logLevel = (LogLevel)prefs.getUChar("logLvl", (uint8_t)LogLevel::LOG_INFO);
   prefs.end();
+}
+
+bool setupWizardComplete() {
+  return !cfg.printerProtocol.isEmpty() && !cfg.printerMethod.isEmpty() && !cfg.wifiSsid.isEmpty();
 }
 
 void saveConfig() {
@@ -91,6 +89,8 @@ void saveConfig() {
   prefs.putUShort("statInt", cfg.statusIntervalSec);
   prefs.putString("printer", cfg.printerName);
   prefs.putString("location", cfg.location);
+  prefs.putString("printProto", cfg.printerProtocol);
+  prefs.putString("printMeth", cfg.printerMethod);
   prefs.putString("zplHost", cfg.zplTargetHost);
   prefs.putUShort("zplPort", cfg.zplTargetPort);
   prefs.putInt("dpi", cfg.dpi);
@@ -98,25 +98,17 @@ void saveConfig() {
   prefs.putInt("labelL", cfg.labelLength);
   prefs.putBool("zplCompr", cfg.zplCompressionSupported);
   prefs.putBool("dbgOut", cfg.debugOutput);
-  prefs.putString("dbgMode", cfg.debugOutputMode);
-  prefs.putInt("dbgTx", cfg.debugUartTxPin);
-  prefs.putInt("dbgRx", cfg.debugUartRxPin);
   prefs.putInt("puTx", cfg.printerUartTxPin);
   prefs.putInt("puRx", cfg.printerUartRxPin);
   prefs.putUInt("puBaud", cfg.printerUartBaud);
-  prefs.putUInt("usbBaud", cfg.printerUsbBaud);
   prefs.putInt("qlHeadPx", cfg.qlPrintheadPx);
   prefs.putInt("qlInval", cfg.qlInvalidateBytes);
   prefs.putBool("qlCut", cfg.qlAutoCut);
   prefs.putInt("qlFeed", cfg.qlFeedMarginDots);
   prefs.putInt("qlRMarg", cfg.qlRightMarginDots);
-  prefs.putString("ledMode", cfg.ledMode);
-  prefs.putInt("ledPin", cfg.ledPin);
-  prefs.putInt("ledPinR", cfg.ledPinR);
-  prefs.putInt("ledPinG", cfg.ledPinG);
-  prefs.putInt("ledPinB", cfg.ledPinB);
-  prefs.putString("ledOrder", cfg.ledOrder);
-  prefs.putUShort("ledBlink", cfg.ledBlinkMs);
+  prefs.putInt("seikoDots", cfg.seikoMaxDots);
+  prefs.putInt("seikoDens", cfg.seikoDensity);
+  prefs.putInt("seikoSpd", cfg.seikoSpeed);
   prefs.putUChar("logLvl", (uint8_t)cfg.logLevel);
   prefs.end();
 }
@@ -128,40 +120,47 @@ void printRuntimeSettings(const char* reason) {
   dbgPrintln(reason);
   dbgPrint("Printer name: ");
   dbgPrintln(cfg.printerName);
-  dbgPrint("Printer type: ");
-  dbgPrintln(PRINTER_TYPE);
+  dbgPrint("Printer protocol: ");
+  dbgPrintln(cfg.printerProtocol.isEmpty() ? String("<not set -- setup wizard incomplete>") : cfg.printerProtocol);
   dbgPrint("Location: ");
   dbgPrintln(cfg.location.isEmpty() ? String("<not set>") : cfg.location);
-#if defined(TARGET_NETWORK)
-  dbgPrint("Target (network): ");
-  dbgPrint(cfg.zplTargetHost);
-  dbgPrint(":");
-  dbgPrintln(cfg.zplTargetPort);
-#elif defined(TARGET_SERIAL)
-  dbgPrint("Target (serial UART) TX/RX/baud: ");
-  dbgPrint(cfg.printerUartTxPin);
-  dbgPrint("/");
-  dbgPrint(cfg.printerUartRxPin);
-  dbgPrint("/");
-  dbgPrintln(cfg.printerUartBaud);
-#elif defined(TARGET_USB)
-  dbgPrint("Target (usb) baud: ");
-  dbgPrintln(cfg.printerUsbBaud);
-#elif defined(TARGET_USB_HOST)
-  dbgPrintln("Target (usb_host): auto-enumerates connected USB printer");
-#endif
-#ifdef PROTOCOL_QL
-  dbgPrint("QL printhead px / invalidate bytes: ");
-  dbgPrint(cfg.qlPrintheadPx);
-  dbgPrint(" / ");
-  dbgPrintln(cfg.qlInvalidateBytes);
-  dbgPrint("QL auto-cut / feed margin / right margin: ");
-  dbgPrint(cfg.qlAutoCut ? "on" : "off");
-  dbgPrint(" / ");
-  dbgPrint(cfg.qlFeedMarginDots);
-  dbgPrint(" / ");
-  dbgPrintln(cfg.qlRightMarginDots);
-#endif
+  if (cfg.printerMethod == "network") {
+    dbgPrint("Target (network): ");
+    dbgPrint(cfg.zplTargetHost);
+    dbgPrint(":");
+    dbgPrintln(cfg.zplTargetPort);
+  } else if (cfg.printerMethod == "serial") {
+    dbgPrint("Target (serial UART) TX/RX/baud: ");
+    dbgPrint(cfg.printerUartTxPin);
+    dbgPrint("/");
+    dbgPrint(cfg.printerUartRxPin);
+    dbgPrint("/");
+    dbgPrintln(cfg.printerUartBaud);
+  } else if (cfg.printerMethod == "usb_host") {
+    dbgPrintln("Target (usb_host): auto-enumerates connected USB printer");
+  } else {
+    dbgPrintln("Target: <not set -- setup wizard incomplete>");
+  }
+  if (cfg.printerProtocol == "ql") {
+    dbgPrint("QL printhead px / invalidate bytes: ");
+    dbgPrint(cfg.qlPrintheadPx);
+    dbgPrint(" / ");
+    dbgPrintln(cfg.qlInvalidateBytes);
+    dbgPrint("QL auto-cut / feed margin / right margin: ");
+    dbgPrint(cfg.qlAutoCut ? "on" : "off");
+    dbgPrint(" / ");
+    dbgPrint(cfg.qlFeedMarginDots);
+    dbgPrint(" / ");
+    dbgPrintln(cfg.qlRightMarginDots);
+  }
+  if (cfg.printerProtocol == "seiko") {
+    dbgPrint("Seiko max dots / density / speed: ");
+    dbgPrint(cfg.seikoMaxDots);
+    dbgPrint(" / ");
+    dbgPrint(cfg.seikoDensity);
+    dbgPrint(" / ");
+    dbgPrintln(cfg.seikoSpeed);
+  }
   dbgPrint("Label (mm): ");
   dbgPrint(cfg.labelWidth);
   dbgPrint("x");
@@ -197,18 +196,6 @@ void printRuntimeSettings(const char* reason) {
   dbgPrintln(statusTopic());
   dbgPrint("Debug output: ");
   dbgPrintln(cfg.debugOutput ? "enabled" : "disabled");
-  dbgPrint("Debug mode: ");
-  dbgPrintln(cfg.debugOutputMode);
-  dbgPrint("Debug UART TX/RX: ");
-  dbgPrint(cfg.debugUartTxPin);
-  dbgPrint("/");
-  dbgPrintln(cfg.debugUartRxPin);
-  dbgPrint("LED mode: ");
-  dbgPrintln(cfg.ledMode);
-  dbgPrint("LED order: ");
-  dbgPrintln(cfg.ledOrder);
-  dbgPrint("LED blink ms: ");
-  dbgPrintln(cfg.ledBlinkMs);
   dbgPrintln("========================================================");
   dbgPrintln();
 }

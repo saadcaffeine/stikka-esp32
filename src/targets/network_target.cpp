@@ -1,7 +1,5 @@
 #include "target.h"
 
-#ifdef TARGET_NETWORK
-
 #include <WiFi.h>
 
 #include "../config.h"
@@ -12,19 +10,19 @@
 // this firmware doesn't parse ZPL/image/QL-raster data itself here, it just
 // forwards whatever bytes the caller hands it (the frontend builds any
 // protocol-specific byte stream, e.g. ZPL or Brother QL raster, client-side).
+// Always compiled in -- only called by target.cpp's dispatcher when
+// cfg.printerMethod=="network".
 static WiFiClient streamClient;
 
-const char* targetMethodName() { return "network"; }
-
-void targetSetup() {
+void networkTargetSetup() {
   // Nothing to pre-open -- a fresh TCP connection is made per job/stream.
 }
 
-void targetLoop() {
+void networkTargetLoop() {
   // Nothing to pump -- WiFiClient's own blocking calls handle everything.
 }
 
-bool targetSend(const uint8_t* data, size_t len, String& err) {
+bool networkTargetSend(const uint8_t* data, size_t len, String& err) {
   if (len == 0) {
     err = "empty payload";
     return false;
@@ -91,12 +89,10 @@ bool targetSend(const uint8_t* data, size_t len, String& err) {
   return true;
 }
 
-bool targetSendString(const String& body, String& err) {
+bool networkTargetSendString(const String& body, String& err) {
   if (body.length() == 0) {
     err = "empty zpl payload";
     return false;
   }
-  return targetSend(reinterpret_cast<const uint8_t*>(body.c_str()), body.length(), err);
+  return networkTargetSend(reinterpret_cast<const uint8_t*>(body.c_str()), body.length(), err);
 }
-
-#endif // TARGET_NETWORK

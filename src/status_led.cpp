@@ -6,6 +6,27 @@
 #include "config.h"
 #include "logging.h"
 
+// Compile-time-only LED wiring -- see platformio.ini's per-board build_flags.
+// Fallback defaults here let this file build standalone even without them.
+#ifndef DEFAULT_LED_MODE
+#define DEFAULT_LED_MODE "none"
+#endif
+#ifndef DEFAULT_LED_PIN
+#define DEFAULT_LED_PIN -1
+#endif
+#ifndef DEFAULT_LED_ORDER
+#define DEFAULT_LED_ORDER "GRB"
+#endif
+#ifndef DEFAULT_LED_BLINK_MS
+#define DEFAULT_LED_BLINK_MS 700
+#endif
+// No board uses discrete-RGB mode today, so unlike LED_MODE/PIN/ORDER these
+// have never been exposed as build_flags -- add DEFAULT_LED_PIN_R/G/B if a
+// future board needs "rgb" mode.
+#define LED_PIN_R -1
+#define LED_PIN_G -1
+#define LED_PIN_B -1
+
 struct RgbColor {
   uint8_t r;
   uint8_t g;
@@ -18,6 +39,7 @@ static unsigned long ledLastToggleMs = 0;
 static bool ledBlinkOn = false;
 static unsigned long ledEventUntilMs = 0;
 static LedEventType ledEventType = LedEventType::none;
+static uint16_t ledBlinkMs = DEFAULT_LED_BLINK_MS;
 
 static neoPixelType neopixelTypeFromOrder(const String& orderRaw) {
   String order = orderRaw;
@@ -41,7 +63,7 @@ static uint8_t componentByOrder(char channel, const RgbColor& c) {
 }
 
 static void clearStatusLed() {
-  if (cfg.ledMode == "neopixel") {
+  if (String(DEFAULT_LED_MODE) == "neopixel") {
     if (statusPixel) {
       statusPixel->setPixelColor(0, statusPixel->Color(0, 0, 0));
       statusPixel->show();
@@ -49,10 +71,10 @@ static void clearStatusLed() {
     return;
   }
 
-  if (cfg.ledMode == "rgb") {
-    if (cfg.ledPinR >= 0) digitalWrite(cfg.ledPinR, LOW);
-    if (cfg.ledPinG >= 0) digitalWrite(cfg.ledPinG, LOW);
-    if (cfg.ledPinB >= 0) digitalWrite(cfg.ledPinB, LOW);
+  if (String(DEFAULT_LED_MODE) == "rgb") {
+    if (LED_PIN_R >= 0) digitalWrite(LED_PIN_R, LOW);
+    if (LED_PIN_G >= 0) digitalWrite(LED_PIN_G, LOW);
+    if (LED_PIN_B >= 0) digitalWrite(LED_PIN_B, LOW);
   }
 }
 
@@ -69,42 +91,44 @@ void setupStatusLed() {
     statusPixel = nullptr;
   }
 
-  if (cfg.ledBlinkMs < 100) cfg.ledBlinkMs = 100;
-  if (cfg.ledBlinkMs > 5000) cfg.ledBlinkMs = 5000;
+  ledBlinkMs = DEFAULT_LED_BLINK_MS;
+  if (ledBlinkMs < 100) ledBlinkMs = 100;
+  if (ledBlinkMs > 5000) ledBlinkMs = 5000;
 
-  if (cfg.ledMode == "neopixel") {
-    if (cfg.ledPin < 0) {
-      dbgPrintln("[led] neopixel mode selected but ledPin < 0", LogLevel::LOG_WARN);
+  if (String(DEFAULT_LED_MODE) == "neopixel") {
+    if (DEFAULT_LED_PIN < 0) {
+      dbgPrintln("[led] neopixel mode selected but DEFAULT_LED_PIN < 0", LogLevel::LOG_WARN);
       return;
     }
-    statusPixel = new Adafruit_NeoPixel(1, (uint8_t)cfg.ledPin, neopixelTypeFromOrder(cfg.ledOrder));
+    statusPixel = new Adafruit_NeoPixel(1, (uint8_t)DEFAULT_LED_PIN, neopixelTypeFromOrder(DEFAULT_LED_ORDER));
     statusPixel->begin();
     statusPixel->clear();
     statusPixel->show();
+    statusPixel->setBrightness(25);
     ledConfigured = true;
     dbgPrint("[led] neopixel on pin ");
-    dbgPrint(cfg.ledPin);
+    dbgPrint(DEFAULT_LED_PIN);
     dbgPrint(", order=");
-    dbgPrintln(cfg.ledOrder, LogLevel::LOG_INFO);
+    dbgPrintln(DEFAULT_LED_ORDER, LogLevel::LOG_INFO);
     return;
   }
 
-  if (cfg.ledMode == "rgb") {
-    if (cfg.ledPinR < 0 || cfg.ledPinG < 0 || cfg.ledPinB < 0) {
+  if (String(DEFAULT_LED_MODE) == "rgb") {
+    if (LED_PIN_R < 0 || LED_PIN_G < 0 || LED_PIN_B < 0) {
       dbgPrintln("[led] rgb mode selected but one or more RGB pins are invalid", LogLevel::LOG_WARN);
       return;
     }
-    pinMode((uint8_t)cfg.ledPinR, OUTPUT);
-    pinMode((uint8_t)cfg.ledPinG, OUTPUT);
-    pinMode((uint8_t)cfg.ledPinB, OUTPUT);
+    pinMode((uint8_t)LED_PIN_R, OUTPUT);
+    pinMode((uint8_t)LED_PIN_G, OUTPUT);
+    pinMode((uint8_t)LED_PIN_B, OUTPUT);
     clearStatusLed();
     ledConfigured = true;
     dbgPrint("[led] rgb pins R/G/B = ");
-    dbgPrint(cfg.ledPinR);
+    dbgPrint(LED_PIN_R);
     dbgPrint("/");
-    dbgPrint(cfg.ledPinG);
+    dbgPrint(LED_PIN_G);
     dbgPrint("/");
-    dbgPrintln(cfg.ledPinB, LogLevel::LOG_INFO);
+    dbgPrintln(LED_PIN_B, LogLevel::LOG_INFO);
     return;
   }
 
@@ -134,15 +158,15 @@ static RgbColor eventStatusColor(LedEventType evt, bool wifiConnected, bool mqtt
 static void setLedColor(const RgbColor& c) {
   if (!ledConfigured) return;
 
-  if (cfg.ledMode == "neopixel") {
+  if (String(DEFAULT_LED_MODE) == "neopixel") {
     if (!statusPixel) return;
     statusPixel->setPixelColor(0, statusPixel->Color(c.r, c.g, c.b));
     statusPixel->show();
     return;
   }
 
-  if (cfg.ledMode == "rgb") {
-    String order = cfg.ledOrder;
+  if (String(DEFAULT_LED_MODE) == "rgb") {
+    String order = DEFAULT_LED_ORDER;
     order.toUpperCase();
     const char c0 = order.length() > 0 ? order[0] : 'R';
     const char c1 = order.length() > 1 ? order[1] : 'G';
@@ -150,9 +174,9 @@ static void setLedColor(const RgbColor& c) {
     const uint8_t vR = componentByOrder(c0, c);
     const uint8_t vG = componentByOrder(c1, c);
     const uint8_t vB = componentByOrder(c2, c);
-    digitalWrite((uint8_t)cfg.ledPinR, vR > 0 ? HIGH : LOW);
-    digitalWrite((uint8_t)cfg.ledPinG, vG > 0 ? HIGH : LOW);
-    digitalWrite((uint8_t)cfg.ledPinB, vB > 0 ? HIGH : LOW);
+    digitalWrite((uint8_t)LED_PIN_R, vR > 0 ? HIGH : LOW);
+    digitalWrite((uint8_t)LED_PIN_G, vG > 0 ? HIGH : LOW);
+    digitalWrite((uint8_t)LED_PIN_B, vB > 0 ? HIGH : LOW);
   }
 }
 
@@ -160,14 +184,14 @@ void markLedEvent(LedEventType eventType) {
   if (!ledConfigured) return;
   ledEventType = eventType;
   const unsigned long now = millis();
-  const unsigned long holdMs = (unsigned long)cfg.ledBlinkMs * 2UL;
+  const unsigned long holdMs = (unsigned long)ledBlinkMs * 2UL;
   ledEventUntilMs = now + (holdMs < 300 ? 300 : holdMs);
 }
 
 void updateStatusLed(bool wifiConnected, bool mqttConnected) {
   if (!ledConfigured) return;
   const unsigned long now = millis();
-  const unsigned long halfBlink = (unsigned long)cfg.ledBlinkMs / 2UL;
+  const unsigned long halfBlink = (unsigned long)ledBlinkMs / 2UL;
   if (halfBlink == 0) return;
 
   if (now - ledLastToggleMs >= halfBlink) {

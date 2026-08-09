@@ -1,7 +1,5 @@
 #include "target.h"
 
-#ifdef TARGET_USB_HOST
-
 #include <usb/usb_host.h>
 
 #include <cstring>
@@ -9,17 +7,17 @@
 #include "../logging.h"
 
 // "usb_host" transport method: this board's ESP32-S2/S3 acts as a genuine
-// USB host -- not the "usb" target's trick of reusing the board's own
-// UART-over-programming-port (usb_target.cpp), which only works if the
-// printer accepts a plain serial/UART connection. This enumerates whatever's
-// plugged into the native USB port, claims it if it's a USB Printer-class
-// device (bInterfaceClass 0x07), and forwards bytes to its bulk OUT
-// endpoint as real USB bulk transfers. Ported from a standalone test sketch
-// that validated this approach against a real Brother QL-720NW before this
-// was integrated here (device enumeration/claim/transfer sequence, and the
-// need for -D ARDUINO_USB_CDC_ON_BOOT=0 in platformio.ini -- without it the
-// board's default native-USB-CDC auto-init fights usb_host_install() for
-// the same OTG peripheral and bootloops).
+// USB host, enumerating whatever's plugged into the native USB port, claims
+// it if it's a USB Printer-class device (bInterfaceClass 0x07), and forwards
+// bytes to its bulk OUT endpoint as real USB bulk transfers. Ported from a
+// standalone test sketch that validated this approach against a real
+// Brother QL-720NW before this was integrated here (device enumeration/
+// claim/transfer sequence, and the need for -D ARDUINO_USB_CDC_ON_BOOT=0 in
+// platformio.ini -- without it the board's default native-USB-CDC auto-init
+// fights usb_host_install() for the same OTG peripheral and bootloops).
+// Always compiled in -- usb_host_install()/usb_host_client_register() below
+// only ever run when target.cpp's dispatcher calls usbHostTargetSetup(),
+// i.e. only when cfg.printerMethod=="usb_host".
 //
 // Requires a board whose USB-C/USB port circuitry can actually source VBUS
 // to a downstream device in host mode -- confirmed for esp32-s2-saola-1 via
@@ -37,11 +35,28 @@ static usb_transfer_t* printerOut = nullptr;
 static volatile bool transferDone = false;
 static volatile bool transferOk = false;
 
+// Fallback path for a bulk-OUT-capable USB device that doesn't identify as a
+// USB Printer-class interface (bInterfaceClass 0x07) -- confirmed hardware
+// validation of the printer-class scan below only covers a Brother QL-720NW.
+// Small integrated label printers (Seiko SLP-series among them) commonly
+// ship a vendor-specific class and a proprietary desktop driver instead of
+// conforming to the Printer Class spec, so the primary scan may find nothing
+// to claim on such a device. This tracks the first bulk-OUT endpoint seen on
+// *any* interface while walking the descriptor, so clientEventCallback() can
+// fall back to claiming it if the printer-class scan comes up empty.
+// Unvalidated against real Seiko hardware -- needs confirmation once a
+// device is available; see stikka-esp32/README.md.
+static bool fallbackEndpointFound = false;
+static uint8_t fallbackInterfaceNumber = 0;
+static uint8_t fallbackAltSetting = 0;
+static uint8_t fallbackEndpointAddress = 0;
+static uint16_t fallbackMaxPacketSize = 0;
+static uint8_t currentInterfaceNumber = 0;
+static uint8_t currentAltSetting = 0;
+
 // USB-IF Printer class code. Hardcoded rather than relying on a
 // USB_CLASS_PRINTER macro -- not confirmed provided by the usb_host headers.
 static const uint8_t USB_CLASS_PRINTER_ = 0x07;
-
-const char* targetMethodName() { return "usb_host"; }
 
 static void printerTransferCb(usb_transfer_t* transfer) {
   if (transfer->device_handle != deviceHandle) return;
@@ -67,6 +82,16 @@ static void scanConfigDescriptor(const usb_config_desc_t* configDesc) {
 
     if (bDescriptorType == USB_B_DESCRIPTOR_TYPE_INTERFACE) {
       const usb_intf_desc_t* intf = reinterpret_cast<const usb_intf_desc_t*>(p);
+      currentInterfaceNumber = intf->bInterfaceNumber;
+      currentAltSetting = intf->bAlternateSetting;
+      dbgPrint("[target] usb_host: interface ");
+      dbgPrint(intf->bInterfaceNumber);
+      dbgPrint(" class=0x");
+      dbgPrint(String(intf->bInterfaceClass, HEX));
+      dbgPrint(" subclass=");
+      dbgPrint(intf->bInterfaceSubClass);
+      dbgPrint(" protocol=");
+      dbgPrintln(intf->bInterfaceProtocol, LogLevel::LOG_DEBUG);
       inPrinterInterface = (intf->bInterfaceClass == USB_CLASS_PRINTER_) &&
                            (intf->bInterfaceSubClass == 1) &&
                            (intf->bInterfaceProtocol == 1 || intf->bInterfaceProtocol == 2);
@@ -82,24 +107,34 @@ static void scanConfigDescriptor(const usb_config_desc_t* configDesc) {
           dbgPrintln(err, LogLevel::LOG_ERROR);
         }
       }
-    } else if (bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT && inPrinterInterface && printerClaimed) {
+    } else if (bDescriptorType == USB_B_DESCRIPTOR_TYPE_ENDPOINT) {
       const usb_ep_desc_t* ep = reinterpret_cast<const usb_ep_desc_t*>(p);
       const bool isBulk = (ep->bmAttributes & USB_BM_ATTRIBUTES_XFERTYPE_MASK) == USB_BM_ATTRIBUTES_XFER_BULK;
       const bool isOut = (ep->bEndpointAddress & USB_B_ENDPOINT_ADDRESS_EP_DIR_MASK) == 0;
-      if (isBulk && isOut && printerOut == nullptr) {
-        const int packetsPerTransfer = 8;
-        const esp_err_t err = usb_host_transfer_alloc(ep->wMaxPacketSize * packetsPerTransfer, 0, &printerOut);
-        if (err == ESP_OK) {
-          printerOut->device_handle = deviceHandle;
-          printerOut->bEndpointAddress = ep->bEndpointAddress;
-          printerOut->callback = printerTransferCb;
-          printerOut->context = nullptr;
-          dbgPrint("[target] usb_host: bulk OUT endpoint ready, buffer=");
-          dbgPrintln(printerOut->data_buffer_size, LogLevel::LOG_INFO);
-        } else {
-          dbgPrint("[target] usb_host: usb_host_transfer_alloc failed: ");
-          dbgPrintln(err, LogLevel::LOG_ERROR);
+      if (inPrinterInterface && printerClaimed) {
+        if (isBulk && isOut && printerOut == nullptr) {
+          const int packetsPerTransfer = 8;
+          const esp_err_t err = usb_host_transfer_alloc(ep->wMaxPacketSize * packetsPerTransfer, 0, &printerOut);
+          if (err == ESP_OK) {
+            printerOut->device_handle = deviceHandle;
+            printerOut->bEndpointAddress = ep->bEndpointAddress;
+            printerOut->callback = printerTransferCb;
+            printerOut->context = nullptr;
+            dbgPrint("[target] usb_host: bulk OUT endpoint ready, buffer=");
+            dbgPrintln(printerOut->data_buffer_size, LogLevel::LOG_INFO);
+          } else {
+            dbgPrint("[target] usb_host: usb_host_transfer_alloc failed: ");
+            dbgPrintln(err, LogLevel::LOG_ERROR);
+          }
         }
+      } else if (isBulk && isOut && !fallbackEndpointFound) {
+        fallbackEndpointFound = true;
+        fallbackInterfaceNumber = currentInterfaceNumber;
+        fallbackAltSetting = currentAltSetting;
+        fallbackEndpointAddress = ep->bEndpointAddress;
+        fallbackMaxPacketSize = ep->wMaxPacketSize;
+        dbgPrint("[target] usb_host: fallback bulk-OUT candidate on interface ");
+        dbgPrintln(currentInterfaceNumber, LogLevel::LOG_DEBUG);
       }
     }
   }
@@ -110,6 +145,7 @@ static void clientEventCallback(const usb_host_client_event_msg_t* eventMsg, voi
     dbgPrintln("[target] usb_host: device gone", LogLevel::LOG_WARN);
     printerClaimed = false;
     printerInterfaceFound = false;
+    fallbackEndpointFound = false;
     if (printerOut != nullptr) {
       usb_host_transfer_free(printerOut);
       printerOut = nullptr;
@@ -139,10 +175,37 @@ static void clientEventCallback(const usb_host_client_event_msg_t* eventMsg, voi
   scanConfigDescriptor(configDesc);
   if (!printerInterfaceFound) {
     dbgPrintln("[target] usb_host: no printer-class interface found on this device", LogLevel::LOG_WARN);
+    if (fallbackEndpointFound) {
+      dbgPrint("[target] usb_host: falling back to first bulk-OUT endpoint on interface ");
+      dbgPrint(fallbackInterfaceNumber);
+      dbgPrintln(" (unvalidated device path -- not USB Printer-class)", LogLevel::LOG_WARN);
+      const esp_err_t claimErr = usb_host_interface_claim(clientHandle, deviceHandle,
+          fallbackInterfaceNumber, fallbackAltSetting);
+      if (claimErr == ESP_OK) {
+        printerClaimed = true;
+        printerInterfaceFound = true;
+        const int packetsPerTransfer = 8;
+        const esp_err_t allocErr = usb_host_transfer_alloc(fallbackMaxPacketSize * packetsPerTransfer, 0, &printerOut);
+        if (allocErr == ESP_OK) {
+          printerOut->device_handle = deviceHandle;
+          printerOut->bEndpointAddress = fallbackEndpointAddress;
+          printerOut->callback = printerTransferCb;
+          printerOut->context = nullptr;
+          dbgPrint("[target] usb_host: fallback bulk OUT endpoint ready, buffer=");
+          dbgPrintln(printerOut->data_buffer_size, LogLevel::LOG_INFO);
+        } else {
+          dbgPrint("[target] usb_host: fallback usb_host_transfer_alloc failed: ");
+          dbgPrintln(allocErr, LogLevel::LOG_ERROR);
+        }
+      } else {
+        dbgPrint("[target] usb_host: fallback usb_host_interface_claim failed: ");
+        dbgPrintln(claimErr, LogLevel::LOG_ERROR);
+      }
+    }
   }
 }
 
-void targetSetup() {
+void usbHostTargetSetup() {
   const usb_host_config_t hostConfig = {
     .intr_flags = ESP_INTR_FLAG_LEVEL1,
   };
@@ -171,7 +234,7 @@ void targetSetup() {
   dbgPrintln((unsigned long)ESP.getMaxAllocHeap(), LogLevel::LOG_INFO);
 }
 
-void targetLoop() {
+void usbHostTargetLoop() {
   uint32_t eventFlags;
   usb_host_lib_handle_events(0, &eventFlags);
   usb_host_client_handle_events(clientHandle, 0);
@@ -183,7 +246,7 @@ void targetLoop() {
 static bool waitForTransfer(unsigned long timeoutMs) {
   const unsigned long start = millis();
   while (!transferDone) {
-    targetLoop();
+    usbHostTargetLoop();
     if (millis() - start > timeoutMs) return false;
   }
   return transferOk;
@@ -193,7 +256,7 @@ static bool waitForTransfer(unsigned long timeoutMs) {
 // device itself disconnects, see USB_HOST_CLIENT_EVENT_DEV_GONE above), so
 // there's nothing to release once a send completes -- unlike the network
 // target's TCP socket.
-bool targetSend(const uint8_t* data, size_t len, String& err) {
+bool usbHostTargetSend(const uint8_t* data, size_t len, String& err) {
   if (len == 0) {
     err = "empty payload";
     return false;
@@ -224,12 +287,10 @@ bool targetSend(const uint8_t* data, size_t len, String& err) {
   return true;
 }
 
-bool targetSendString(const String& body, String& err) {
+bool usbHostTargetSendString(const String& body, String& err) {
   if (body.length() == 0) {
     err = "empty zpl payload";
     return false;
   }
-  return targetSend(reinterpret_cast<const uint8_t*>(body.c_str()), body.length(), err);
+  return usbHostTargetSend(reinterpret_cast<const uint8_t*>(body.c_str()), body.length(), err);
 }
-
-#endif // TARGET_USB_HOST

@@ -159,7 +159,7 @@ static String buildStatusJson(const char* phase, const char* lastError) {
   doc["online"] = true;
   doc["busy"] = String(phase) == "printing";
   doc["phase"] = phase;
-  doc["type"] = PRINTER_TYPE;
+  doc["type"] = cfg.printerProtocol;
   doc["serial"] = String((uint32_t)ESP.getEfuseMac(), HEX);
   doc["location"] = cfg.location;
   doc["dpi"] = cfg.dpi;
@@ -173,7 +173,7 @@ static String buildStatusJson(const char* phase, const char* lastError) {
   label["cut"] = false;
 
   JsonObject capabilities = doc["capabilities"].to<JsonObject>();
-  capabilities["type"] = PRINTER_TYPE;
+  capabilities["type"] = cfg.printerProtocol;
   capabilities["dpi"] = cfg.dpi;
   capabilities["zplCompression"] = cfg.zplCompressionSupported;
   // Brother QL raster protocol knobs -- the frontend now builds the whole
@@ -185,6 +185,10 @@ static String buildStatusJson(const char* phase, const char* lastError) {
   capabilities["qlAutoCut"] = cfg.qlAutoCut;
   capabilities["qlFeedMarginDots"] = cfg.qlFeedMarginDots;
   capabilities["qlRightMarginDots"] = cfg.qlRightMarginDots;
+  // Seiko SLP raster protocol knobs -- same rationale as the ql* ones above.
+  capabilities["seikoMaxDots"] = cfg.seikoMaxDots;
+  capabilities["seikoDensity"] = cfg.seikoDensity;
+  capabilities["seikoSpeed"] = cfg.seikoSpeed;
   JsonObject capLabel = capabilities["label"].to<JsonObject>();
   capLabel["width"] = cfg.labelWidth;
   capLabel["length"] = cfg.labelLength;
@@ -321,12 +325,12 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
   publishJobStatus(jobId, "accepted", "job accepted");
 
   if (String(payloadType) == "zpl") {
-#ifdef PROTOCOL_QL
-    dbgPrintln("[zpl] rejected: this firmware build only accepts image jobs (Brother QL raster protocol)", LogLevel::LOG_ERROR);
-    publishJobStatus(jobId, "failed", "this printer only accepts image jobs (Brother QL raster, no raw ZPL)");
-    publishStatus("error", "zpl payload_type not supported by this printer");
-    return;
-#else
+    if (cfg.printerProtocol == "ql" || cfg.printerProtocol == "seiko") {
+      dbgPrintln("[zpl] rejected: this printer is configured for pre-rasterized jobs (" + cfg.printerProtocol + " raster protocol), not raw ZPL", LogLevel::LOG_ERROR);
+      publishJobStatus(jobId, "failed", "this printer only accepts pre-rasterized jobs, no raw ZPL");
+      publishStatus("error", "zpl payload_type not supported by this printer");
+      return;
+    }
     dbgPrint("[zpl] command received, encoding=");
     dbgPrintln(payloadEncoding);
     String zplBody;
@@ -382,16 +386,15 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
     publishJobStatus(jobId, "done", "zpl sent");
     publishStatus("ready", "");
     return;
-#endif // PROTOCOL_QL
   }
 
   if (String(payloadType) == "image") {
-#ifdef PROTOCOL_QL
-    dbgPrintln("[image] rejected: this firmware build only accepts ql_raster jobs (frontend pre-rasterizes to Brother QL raster protocol)", LogLevel::LOG_ERROR);
-    publishJobStatus(jobId, "failed", "this printer only accepts ql_raster jobs (frontend-rasterized Brother QL raster), not raw image");
-    publishStatus("error", "image payload_type not supported by this printer");
-    return;
-#else
+    if (cfg.printerProtocol == "ql" || cfg.printerProtocol == "seiko") {
+      dbgPrintln("[image] rejected: this printer is configured for " + cfg.printerProtocol + "_raster jobs (frontend pre-rasterizes client-side)", LogLevel::LOG_ERROR);
+      publishJobStatus(jobId, "failed", "this printer only accepts pre-rasterized jobs (frontend-rasterized), not raw image");
+      publishStatus("error", "image payload_type not supported by this printer");
+      return;
+    }
     dbgPrint("[image] command received, encoding=");
     dbgPrintln(payloadEncoding);
     dbgPrintln("[image] job start jobId=" + String(jobId), LogLevel::LOG_INFO);
@@ -441,16 +444,15 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
     publishJobStatus(jobId, "done", "image bytes sent");
     publishStatus("ready", "");
     return;
-#endif // PROTOCOL_QL
   }
 
   if (String(payloadType) == "ql_raster") {
-#ifndef PROTOCOL_QL
-    dbgPrintln("[ql] rejected: this firmware build does not support ql_raster jobs", LogLevel::LOG_ERROR);
-    publishJobStatus(jobId, "failed", "this printer does not support ql_raster jobs");
-    publishStatus("error", "ql_raster payload_type not supported by this printer");
-    return;
-#else
+    if (cfg.printerProtocol != "ql") {
+      dbgPrintln("[ql] rejected: this printer is not configured for ql_raster jobs", LogLevel::LOG_ERROR);
+      publishJobStatus(jobId, "failed", "this printer does not support ql_raster jobs");
+      publishStatus("error", "ql_raster payload_type not supported by this printer");
+      return;
+    }
     dbgPrint("[ql] command received, encoding=");
     dbgPrintln(payloadEncoding);
 
@@ -484,7 +486,48 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
     publishJobStatus(jobId, "done", "ql raster bytes sent");
     publishStatus("ready", "");
     return;
-#endif // PROTOCOL_QL
+  }
+
+  if (String(payloadType) == "seiko_raster") {
+    if (cfg.printerProtocol != "seiko") {
+      dbgPrintln("[seiko] rejected: this printer is not configured for seiko_raster jobs", LogLevel::LOG_ERROR);
+      publishJobStatus(jobId, "failed", "this printer does not support seiko_raster jobs");
+      publishStatus("error", "seiko_raster payload_type not supported by this printer");
+      return;
+    }
+    dbgPrint("[seiko] command received, encoding=");
+    dbgPrintln(payloadEncoding);
+
+    if (String(payloadEncoding) != "base64_bytes") {
+      dbgPrintln("[seiko] unsupported payload_encoding: " + String(payloadEncoding), LogLevel::LOG_ERROR);
+      publishJobStatus(jobId, "failed", "unsupported seiko_raster payload_encoding");
+      publishStatus("error", "unsupported seiko_raster payload_encoding");
+      return;
+    }
+
+    dbgPrintln("[seiko] job start jobId=" + String(jobId), LogLevel::LOG_INFO);
+    std::unique_ptr<uint8_t[]> bytes;
+    size_t decodedLen = 0;
+    String decodeErr;
+    if (!decodeBase64Payload(body, bytes, decodedLen, decodeErr)) {
+      dbgPrintln("[seiko] decode failed: " + decodeErr, LogLevel::LOG_ERROR);
+      publishJobStatus(jobId, "failed", decodeErr.c_str());
+      publishStatus("error", decodeErr.c_str());
+      return;
+    }
+
+    String sendErr;
+    if (!targetSend(bytes.get(), decodedLen, sendErr)) {
+      dbgPrintln("[seiko] send failed: " + sendErr, LogLevel::LOG_ERROR);
+      publishJobStatus(jobId, "failed", sendErr.c_str());
+      publishStatus("error", sendErr.c_str());
+      return;
+    }
+
+    dbgPrintln("[seiko] job sent to target successfully", LogLevel::LOG_INFO);
+    publishJobStatus(jobId, "done", "seiko raster bytes sent");
+    publishStatus("ready", "");
+    return;
   }
 
   dbgPrintln("[mqtt] unsupported payload_type: " + String(payloadType), LogLevel::LOG_ERROR);

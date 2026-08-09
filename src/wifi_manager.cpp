@@ -1,5 +1,6 @@
 #include "wifi_manager.h"
 
+#include <ArduinoJson.h>
 #include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <WiFi.h>
@@ -22,6 +23,9 @@ static const unsigned long WIFI_RETRY_EVERY_MS = 5000;
 static const unsigned long WIFI_FALLBACK_AP_AFTER_MS = 20000;
 static const char* AP_PASSWORD = "stikkaesp32";
 static const uint16_t DNS_PORT = 53;
+// Overrides the ESP32 Arduino core's default soft-AP IP (192.168.4.1).
+static const IPAddress AP_IP(1, 2, 3, 4);
+static const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 bool wifiIsConnected() {
   return WiFi.status() == WL_CONNECTED;
@@ -99,8 +103,13 @@ static void startMdns() {
 
 static void ensureFallbackAp() {
   if (apModeActive) return;
+  // Explicit, not assumed left over from wifiManagerSetup(): dropToStaOnly()
+  // below can turn this back down to WIFI_STA whenever a connected device
+  // never needed the AP, so it has to be re-armed here every time.
+  WiFi.mode(WIFI_AP_STA);
   const String ssid = wifiFallbackApSsid();
   if (WiFi.softAP(ssid.c_str(), AP_PASSWORD)) {
+    WiFi.softAPConfig(AP_IP, AP_IP, AP_SUBNET);
     apModeActive = true;
     dnsServer.start(DNS_PORT, "*", WiFi.softAPIP());
     dnsServerActive = true;
@@ -109,6 +118,23 @@ static void ensureFallbackAp() {
     dbgPrint(" (ip=");
     dbgPrint(WiFi.softAPIP());
     dbgPrintln(")", LogLevel::LOG_WARN);
+  }
+}
+
+// Drops the radio to WIFI_STA (no AP interface at all) once we know the
+// fallback AP isn't needed. Distinct from wifiDisableFallbackAp() below:
+// that one only runs its teardown when apModeActive is true, i.e. only after
+// *this* code explicitly started an AP via ensureFallbackAp() -- a device
+// that connects to station Wi-Fi on its very first attempt never sets
+// apModeActive, but wifiManagerSetup() still leaves it in WIFI_AP_STA from
+// boot. Left alone, the SoftAP interface stays enabled with the SDK's
+// default/unconfigured AP config, which broadcasts a stray "ESP-<hex>"
+// network for as long as the device is up -- observed in the field, one per
+// already-connected device. Safe to call unconditionally on every confirmed
+// station connection regardless of AP history.
+static void dropToStaOnly() {
+  if (WiFi.getMode() != WIFI_STA) {
+    WiFi.mode(WIFI_STA);
   }
 }
 
@@ -134,6 +160,7 @@ static void connectWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     wifiDisconnectedSinceMs = 0;
     wifiDisableFallbackAp();
+    dropToStaOnly();
     return;
   }
 
@@ -198,6 +225,62 @@ void printNetworkState(const char* reason) {
   dbgPrintln(mqttIsConnected() ? "connected" : "disconnected");
   dbgPrintln("-----------------------------------------------");
   dbgPrintln();
+}
+
+void wifiStartScan() {
+  if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return;
+  WiFi.scanDelete();
+  WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+}
+
+String wifiScanResultJson() {
+  const int16_t n = WiFi.scanComplete();
+  JsonDocument doc;
+
+  if (n == WIFI_SCAN_RUNNING) {
+    doc["status"] = "scanning";
+  } else if (n == WIFI_SCAN_FAILED) {
+    doc["status"] = "failed";
+  } else if (n < 0) {
+    doc["status"] = "idle";
+  } else {
+    doc["status"] = "done";
+    JsonArray arr = doc["networks"].to<JsonArray>();
+    // n is small (real-world scans rarely exceed a few dozen APs), so this
+    // repeated linear scan to pick strongest-first while skipping
+    // already-listed SSIDs (mesh routers commonly broadcast the same name
+    // from multiple APs) is cheap -- not worth a sort/dedup data structure
+    // for a one-off web request.
+    for (int rank = 0; rank < n; rank++) {
+      int best = -1;
+      int32_t bestRssi = INT32_MIN;
+      for (int i = 0; i < n; i++) {
+        if (WiFi.SSID(i).isEmpty()) continue;
+        bool alreadyListed = false;
+        for (JsonObject existing : arr) {
+          if (existing["ssid"] == WiFi.SSID(i)) {
+            alreadyListed = true;
+            break;
+          }
+        }
+        if (alreadyListed) continue;
+        if (WiFi.RSSI(i) > bestRssi) {
+          bestRssi = WiFi.RSSI(i);
+          best = i;
+        }
+      }
+      if (best < 0) break;
+      JsonObject net = arr.add<JsonObject>();
+      net["ssid"] = WiFi.SSID(best);
+      net["rssi"] = WiFi.RSSI(best);
+      net["secure"] = WiFi.encryptionType(best) != WIFI_AUTH_OPEN;
+    }
+    WiFi.scanDelete();
+  }
+
+  String out;
+  serializeJson(doc, out);
+  return out;
 }
 
 void wifiManagerSetup() {

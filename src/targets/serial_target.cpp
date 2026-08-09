@@ -1,21 +1,20 @@
 #include "target.h"
 
-#ifdef TARGET_SERIAL
-
 #include "../config.h"
 #include "../logging.h"
 
 // "serial" transport method: relays bytes to a dedicated hardware UART
 // (UART2, on cfg.printerUartTxPin/printerUartRxPin) wired straight to the
-// printer's serial input -- distinct from the debug UART (logging.cpp) and
-// from the board's USB/programming port (usb_target.cpp), so print traffic
-// never shares a wire with anything else.
+// printer's serial input -- distinct from the debug output port (always
+// UART0/the programming port, see logging.cpp), so print traffic never
+// shares a wire with anything else. Always compiled in -- only called by
+// target.cpp's dispatcher when cfg.printerMethod=="serial". Constructing
+// this HardwareSerial is safe even when serial isn't the selected method:
+// it doesn't touch hardware until .begin() below, in serialTargetSetup().
 static HardwareSerial printerUart(2);
 static bool uartStarted = false;
 
-const char* targetMethodName() { return "serial"; }
-
-void targetSetup() {
+void serialTargetSetup() {
   if (cfg.printerUartTxPin < 0 || cfg.printerUartRxPin < 0) {
     dbgPrintln("[target] serial target TX/RX pin not configured", LogLevel::LOG_ERROR);
     return;
@@ -30,11 +29,11 @@ void targetSetup() {
   dbgPrintln(cfg.printerUartBaud, LogLevel::LOG_INFO);
 }
 
-void targetLoop() {
+void serialTargetLoop() {
   // Nothing to pump -- HardwareSerial's own blocking calls handle everything.
 }
 
-bool targetSend(const uint8_t* data, size_t len, String& err) {
+bool serialTargetSend(const uint8_t* data, size_t len, String& err) {
   if (len == 0) {
     err = "empty payload";
     return false;
@@ -48,12 +47,10 @@ bool targetSend(const uint8_t* data, size_t len, String& err) {
   return ok;
 }
 
-bool targetSendString(const String& body, String& err) {
+bool serialTargetSendString(const String& body, String& err) {
   if (body.length() == 0) {
     err = "empty zpl payload";
     return false;
   }
-  return targetSend(reinterpret_cast<const uint8_t*>(body.c_str()), body.length(), err);
+  return serialTargetSend(reinterpret_cast<const uint8_t*>(body.c_str()), body.length(), err);
 }
-
-#endif // TARGET_SERIAL

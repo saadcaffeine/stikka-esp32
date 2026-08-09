@@ -244,7 +244,7 @@ the bridge opens an AP so you can still configure it.
 
 - SSID: Stikka-<chip suffix>
 - Password: stikkaesp32
-- AP IP: 192.168.4.1
+- AP IP: 1.2.3.4
 
 The AP state is shown on the setup page.
 
@@ -258,7 +258,7 @@ and hyphens only; invalid characters collapse to a single hyphen). Browse to
 your router. The responder (re)starts on every fresh station connection, so
 changing the printer name via the web UI's Save button (which forces a
 Wi-Fi reconnect) picks up the new hostname automatically. Not available
-while only the fallback AP is up (see above) -- `192.168.4.1` already serves
+while only the fallback AP is up (see above) -- `1.2.3.4` already serves
 that purpose there. mDNS resolution depends on your OS/browser (works out of
 the box on macOS/iOS and most Linux with Avahi; Windows needs Bonjour or an
 mDNS-aware browser) -- if `.local` doesn't resolve for you, fall back to the
