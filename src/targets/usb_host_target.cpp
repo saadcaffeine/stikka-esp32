@@ -35,6 +35,16 @@ static usb_transfer_t* printerOut = nullptr;
 static volatile bool transferDone = false;
 static volatile bool transferOk = false;
 
+// Interface number currently claimed via usb_host_interface_claim() (primary
+// printer-class path or the fallback path below) -- needed by DEV_GONE
+// handling to release it before closing the device. Without that release,
+// the Host Library considers the device still in use by this client and
+// won't fully free it: usb_host_device_addr_list_fill() keeps reporting the
+// same stale address, and any usb_host_device_open() attempt on it fails
+// with ESP_ERR_INVALID_STATE (0x103/259) -- permanently, not just for a
+// short race window -- until a physical replug or reboot.
+static uint8_t claimedInterfaceNumber = 0;
+
 // Fallback path for a bulk-OUT-capable USB device that doesn't identify as a
 // USB Printer-class interface (bInterfaceClass 0x07) -- confirmed hardware
 // validation of the printer-class scan below only covers a Brother QL-720NW.
@@ -101,6 +111,7 @@ static void scanConfigDescriptor(const usb_config_desc_t* configDesc) {
             intf->bInterfaceNumber, intf->bAlternateSetting);
         if (err == ESP_OK) {
           printerClaimed = true;
+          claimedInterfaceNumber = intf->bInterfaceNumber;
           dbgPrintln("[target] usb_host: printer interface claimed", LogLevel::LOG_INFO);
         } else {
           dbgPrint("[target] usb_host: usb_host_interface_claim failed: ");
@@ -140,24 +151,14 @@ static void scanConfigDescriptor(const usb_config_desc_t* configDesc) {
   }
 }
 
-static void clientEventCallback(const usb_host_client_event_msg_t* eventMsg, void* arg) {
-  if (eventMsg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
-    dbgPrintln("[target] usb_host: device gone", LogLevel::LOG_WARN);
-    printerClaimed = false;
-    printerInterfaceFound = false;
-    fallbackEndpointFound = false;
-    if (printerOut != nullptr) {
-      usb_host_transfer_free(printerOut);
-      printerOut = nullptr;
-    }
-    return;
-  }
-  if (eventMsg->event != USB_HOST_CLIENT_EVENT_NEW_DEV) return;
-
-  dbgPrint("[target] usb_host: new device address=");
-  dbgPrintln(eventMsg->new_dev.address, LogLevel::LOG_INFO);
-
-  const esp_err_t openErr = usb_host_device_open(clientHandle, eventMsg->new_dev.address, &deviceHandle);
+// Opens the device at `address` (if not already open under this client) and
+// attempts to claim a USB Printer-class interface on it, same descriptor
+// scan/claim/fallback sequence as always ran inline in clientEventCallback's
+// USB_HOST_CLIENT_EVENT_NEW_DEV case. Extracted so attemptUsbReconnect() below
+// can run the exact same logic against a device this client never got a
+// NEW_DEV notification for.
+static void openAndClaimDevice(uint8_t address) {
+  const esp_err_t openErr = usb_host_device_open(clientHandle, address, &deviceHandle);
   if (openErr != ESP_OK) {
     dbgPrint("[target] usb_host: usb_host_device_open failed: ");
     dbgPrintln(openErr, LogLevel::LOG_ERROR);
@@ -184,6 +185,7 @@ static void clientEventCallback(const usb_host_client_event_msg_t* eventMsg, voi
       if (claimErr == ESP_OK) {
         printerClaimed = true;
         printerInterfaceFound = true;
+        claimedInterfaceNumber = fallbackInterfaceNumber;
         const int packetsPerTransfer = 8;
         const esp_err_t allocErr = usb_host_transfer_alloc(fallbackMaxPacketSize * packetsPerTransfer, 0, &printerOut);
         if (allocErr == ESP_OK) {
@@ -203,6 +205,43 @@ static void clientEventCallback(const usb_host_client_event_msg_t* eventMsg, voi
       }
     }
   }
+}
+
+static void clientEventCallback(const usb_host_client_event_msg_t* eventMsg, void* arg) {
+  if (eventMsg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
+    dbgPrintln("[target] usb_host: device gone", LogLevel::LOG_WARN);
+    if (printerOut != nullptr) {
+      usb_host_transfer_free(printerOut);
+      printerOut = nullptr;
+    }
+    if (deviceHandle != nullptr) {
+      // The client contract (usb_host_device_close()'s doc comment) requires
+      // releasing any claimed interface before closing the device -- skip
+      // this and the Host Library keeps the device object alive waiting for
+      // a release that never comes, so it never gets freed even though it's
+      // physically gone. That's what was causing the *permanent* (not just a
+      // brief race) "usb_host_device_open failed: 259" (ESP_ERR_INVALID_STATE)
+      // on every later reconnect attempt at the same address.
+      if (printerClaimed) {
+        const esp_err_t relErr = usb_host_interface_release(clientHandle, deviceHandle, claimedInterfaceNumber);
+        dbgPrint("[target] usb_host: interface release on device-gone: ");
+        dbgPrintln(relErr, LogLevel::LOG_WARN);
+      }
+      const esp_err_t closeErr = usb_host_device_close(clientHandle, deviceHandle);
+      dbgPrint("[target] usb_host: device close on device-gone: ");
+      dbgPrintln(closeErr, LogLevel::LOG_WARN);
+      deviceHandle = nullptr;
+    }
+    printerClaimed = false;
+    printerInterfaceFound = false;
+    fallbackEndpointFound = false;
+    return;
+  }
+  if (eventMsg->event != USB_HOST_CLIENT_EVENT_NEW_DEV) return;
+
+  dbgPrint("[target] usb_host: new device address=");
+  dbgPrintln(eventMsg->new_dev.address, LogLevel::LOG_INFO);
+  openAndClaimDevice(eventMsg->new_dev.address);
 }
 
 void usbHostTargetSetup() {
@@ -252,6 +291,85 @@ static bool waitForTransfer(unsigned long timeoutMs) {
   return transferOk;
 }
 
+// Recovers the bulk OUT endpoint after a submit failure or a stalled/timed-out
+// transfer, so usbHostTargetSend() can retry instead of failing the whole job
+// (and every job after it, until a physical replug) on a single glitch. Per
+// usb_host.h's documented contract: a transfer error implicitly halts the
+// endpoint, and it must be flushed then cleared before it'll accept transfers
+// again -- usb_host_endpoint_halt() is called too (best-effort) to force that
+// halted state in the timeout case, where the transfer's completion callback
+// never fired so the library may not have auto-halted it yet.
+static void resetUsbEndpoint() {
+  if (deviceHandle == nullptr || printerOut == nullptr) return;
+  const uint8_t ep = printerOut->bEndpointAddress;
+  usb_host_endpoint_halt(deviceHandle, ep);
+  usb_host_endpoint_flush(deviceHandle, ep);
+  const esp_err_t clearErr = usb_host_endpoint_clear(deviceHandle, ep);
+  dbgPrint("[target] usb_host: endpoint reset after transfer error, clear result: ");
+  dbgPrintln(clearErr, LogLevel::LOG_WARN);
+}
+
+// Called when a send is attempted with no printer currently claimed. Pumps
+// pending USB host events first (targetLoop() already does this every
+// loop() iteration, but a job can land in the same tick a device reappears)
+// and, if that doesn't produce a claimed printer, proactively lists already-
+// attached device addresses and tries each one. That second step matters
+// because a NEW_DEV client event only fires for devices the Host Library
+// enumerates *after* this client registered -- a printer that was already
+// plugged in (or that reappeared while this client's event queue was full)
+// would otherwise never get (re-)claimed until a physical unplug/replug.
+static bool attemptUsbReconnect() {
+  for (int i = 0; i < 5 && !printerClaimed; i++) {
+    usbHostTargetLoop();
+  }
+  if (printerClaimed) return true;
+
+  // A device that just went through USB_HOST_CLIENT_EVENT_DEV_GONE (or is
+  // mid-bus-reset while re-enumerating) can sit in a transient state for a
+  // short window where usb_host_device_addr_list_fill() still reports it but
+  // usb_host_device_open() rejects it with ESP_ERR_INVALID_STATE -- observed
+  // in practice as "usb_host_device_open failed: 259" immediately after a
+  // "device gone" log, i.e. the Host Library hadn't finished tearing the old
+  // device object down yet. Retry the whole probe a few times with a short
+  // delay (pumping events in between, in case the retry gap is what it takes
+  // for a queued NEW_DEV to land) rather than failing on the first race.
+  const int maxAttempts = 5;
+  const unsigned long retryDelayMs = 150;
+  for (int attempt = 0; attempt < maxAttempts; attempt++) {
+    if (attempt > 0) {
+      delay(retryDelayMs);
+      usbHostTargetLoop();
+      if (printerClaimed) return true;
+    }
+
+    uint8_t addrList[8];
+    int numDevices = 0;
+    const esp_err_t fillErr = usb_host_device_addr_list_fill(8, addrList, &numDevices);
+    if (fillErr != ESP_OK) {
+      dbgPrint("[target] usb_host: reconnect: usb_host_device_addr_list_fill failed: ");
+      dbgPrintln(fillErr, LogLevel::LOG_ERROR);
+      continue;
+    }
+    if (numDevices == 0) {
+      dbgPrintln("[target] usb_host: reconnect: no attached devices yet", LogLevel::LOG_WARN);
+      continue;
+    }
+
+    dbgPrint("[target] usb_host: reconnect: probing ");
+    dbgPrint(numDevices);
+    dbgPrintln(" attached device(s)", LogLevel::LOG_INFO);
+
+    for (int i = 0; i < numDevices && !printerClaimed; i++) {
+      openAndClaimDevice(addrList[i]);
+    }
+    if (printerClaimed) return true;
+  }
+  dbgPrint("[target] usb_host: reconnect: giving up after ");
+  dbgPrint(maxAttempts);
+  dbgPrintln(" attempts", LogLevel::LOG_ERROR);
+  return false;
+}
+
 // The USB device/interface claim persists across jobs (torn down only if the
 // device itself disconnects, see USB_HOST_CLIENT_EVENT_DEV_GONE above), so
 // there's nothing to release once a send completes -- unlike the network
@@ -262,26 +380,48 @@ bool usbHostTargetSend(const uint8_t* data, size_t len, String& err) {
     return false;
   }
   if (!printerClaimed || printerOut == nullptr) {
-    err = "no USB printer enumerated yet";
-    return false;
+    if (!attemptUsbReconnect()) {
+      err = "no USB printer enumerated yet";
+      return false;
+    }
   }
 
   size_t sent = 0;
   while (sent < len) {
+    if (!printerClaimed || printerOut == nullptr) {
+      err = "usb printer disconnected mid-transfer";
+      return false;
+    }
     const size_t chunk = min(len - sent, (size_t)printerOut->data_buffer_size);
-    memcpy(printerOut->data_buffer, data + sent, chunk);
-    printerOut->num_bytes = chunk;
-    transferDone = false;
-    transferOk = false;
-    const esp_err_t submitErr = usb_host_transfer_submit(printerOut);
-    if (submitErr != ESP_OK) {
-      err = "usb_host_transfer_submit failed: 0x" + String(submitErr, HEX);
-      return false;
+    bool chunkOk = false;
+
+    // One retry: if the first attempt fails, reset the endpoint (halt/flush/
+    // clear) and resubmit the same chunk before giving up on the whole job.
+    for (int attempt = 0; attempt < 2; attempt++) {
+      if (!printerClaimed || printerOut == nullptr) {
+        err = "usb printer disconnected mid-transfer";
+        return false;
+      }
+      if (attempt > 0) {
+        dbgPrintln("[target] usb_host: transfer failed, retrying after endpoint reset", LogLevel::LOG_WARN);
+      }
+      memcpy(printerOut->data_buffer, data + sent, chunk);
+      printerOut->num_bytes = chunk;
+      transferDone = false;
+      transferOk = false;
+      const esp_err_t submitErr = usb_host_transfer_submit(printerOut);
+      if (submitErr != ESP_OK) {
+        err = "usb_host_transfer_submit failed: 0x" + String(submitErr, HEX);
+      } else if (!waitForTransfer(2000)) {
+        err = "usb bulk transfer timed out";
+      } else {
+        chunkOk = true;
+        break;
+      }
+      if (printerClaimed && printerOut != nullptr) resetUsbEndpoint();
     }
-    if (!waitForTransfer(2000)) {
-      err = "usb bulk transfer timed out";
-      return false;
-    }
+
+    if (!chunkOk) return false;
     sent += chunk;
   }
   return true;

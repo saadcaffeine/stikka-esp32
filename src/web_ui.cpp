@@ -1,7 +1,9 @@
 #include "web_ui.h"
 
+#include <Update.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <StreamString.h>
 
 #include "config.h"
 #include "logging.h"
@@ -33,11 +35,20 @@ static uint16_t parsePort(const String& value, uint16_t fallback) {
 }
 
 // Protocol+method combinations actually implemented *and* tested. The
-// firmware itself can run other combinations (serial method, Seiko SLP
-// protocol -- see targets/serial_target.cpp, the "seiko" branches throughout
-// this file), but they haven't been validated against real hardware yet, so
-// the web UI deliberately doesn't offer them. Add a row here once a new
-// combination has been confirmed working.
+// firmware itself can run other combinations (serial method -- see
+// targets/serial_target.cpp), but they haven't been validated against real
+// hardware yet, so the web UI deliberately doesn't offer them. Add a row
+// here once a new combination has been confirmed working.
+//
+// seiko_usb_host is here under active hardware validation: unlike
+// ql_usb_host (confirmed against a Brother QL-720NW, which identifies as a
+// USB Printer-class interface, bInterfaceClass 0x07), Seiko SLP-series
+// printers commonly expose a vendor-specific USB class instead, so this
+// exercises usb_host_target.cpp's fallback bulk-OUT-endpoint claim path
+// (see fallbackEndpointFound et al there) rather than the primary
+// printer-class scan. If that path turns out not to match real Seiko
+// hardware, expect to be back in usb_host_target.cpp's descriptor walk, not
+// here.
 struct PrinterTypeOption {
   const char* value;     // posted <select> value, "<protocol>_<method>"
   const char* protocol;  // -> cfg.printerProtocol
@@ -49,6 +60,7 @@ static const PrinterTypeOption kPrinterTypeOptions[] = {
     {"zpl_network", "zpl", "network", "Zebra / generic ZPL &mdash; Network (TCP)"},
     {"zpl_usb_host", "zpl", "usb_host", "Zebra / generic ZPL &mdash; USB (printer plugged into this board)"},
     {"ql_usb_host", "ql", "usb_host", "Brother QL &mdash; USB (printer plugged into this board)"},
+    {"seiko_usb_host", "seiko", "usb_host", "Seiko SLP &mdash; USB (printer plugged into this board)"},
 };
 static const size_t kPrinterTypeOptionCount = sizeof(kPrinterTypeOptions) / sizeof(kPrinterTypeOptions[0]);
 
@@ -91,25 +103,64 @@ static String printerTypeFieldHtml() {
   return html;
 }
 
-// Scan button + status line + results dropdown, dropped in next to the SSID
-// field on both renderWizardPage() and renderConfigPage(). Targets the
-// nearest input[name='wifiSsid'] on the page rather than an id, since both
-// pages already use that same field name and this markup is identical on
-// both -- see wifiScanScriptTag() below for the polling logic.
+// Up to MAX_SAVED_WIFI_NETWORKS entries remembered via rememberWifiNetwork()
+// (populated by the scan Connect button and by both Save forms -- see
+// handleWizardSave()/handleSave()/handleWifiScanConnect() above). Each row's
+// own "Connect" POSTs just the ssid to /wifi-scan/connect-saved, which looks
+// the password up server-side, so a saved password never has to appear in
+// the page again. "Forget" is a plain form POST + redirect, not fetch()+JS,
+// since it's rare enough not to need live feedback.
+static String savedWifiNetworksHtml() {
+  if (cfg.savedWifiNetworkCount <= 0) return String();
+  String html;
+  html += "<div style='margin-top:.75rem;'><small><strong>Saved networks</strong></small>";
+  for (int i = 0; i < cfg.savedWifiNetworkCount; i++) {
+    const String& ssid = cfg.savedWifiNetworks[i].ssid;
+    const String escaped = htmlEscape(ssid);
+    html += "<div style='display:flex;align-items:center;gap:.4rem;margin-top:.3rem;'>";
+    html += "<span style='flex:1;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>" + escaped + "</span>";
+    html += "<button type='button' class='savedWifiConnectBtn' data-ssid='" + escaped + "' style='width:auto;margin-top:0;padding:.25rem .6rem;'>Connect</button>";
+    html += "<form method='POST' action='/wifi-forget' style='margin:0;'>";
+    html += "<input type='hidden' name='ssid' value='" + escaped + "'>";
+    html += "<button type='submit' style='width:auto;margin-top:0;padding:.25rem .6rem;'>Forget</button>";
+    html += "</form>";
+    html += "</div>";
+  }
+  html += "</div>";
+  return html;
+}
+
+// Scan button + status line + results dropdown + Connect button, dropped in
+// next to the SSID field on both renderWizardPage() and renderConfigPage(),
+// followed by the saved-networks list above. Targets the nearest
+// input[name='wifiSsid']/[name='wifiPassword'] on the page rather than an
+// id, since both pages already use those same field names and this markup
+// is identical on both -- see wifiScanScriptTag() below for the
+// polling/connect logic.
 static String wifiScanWidgetHtml() {
   String html;
   html += "<button type='button' id='wifiScanBtn' style='width:auto;margin-top:.5rem;'>Scan for networks</button>";
   html += "<div id='wifiScanStatus' style='margin-top:.35rem;font-size:.85rem;color:#666;'></div>";
   html += "<select id='wifiScanResults' style='display:none;'></select>";
+  html += "<button type='button' id='wifiConnectBtn' style='width:auto;margin-top:.5rem;display:none;'>Connect</button>";
+  html += "<div id='wifiConnectStatus' style='margin-top:.35rem;font-size:.85rem;color:#666;'></div>";
+  html += savedWifiNetworksHtml();
   return html;
 }
 
 // POST /wifi-scan/start kicks off an async scan; this polls GET
 // /wifi-scan/result (wifiScanResultJson() in wifi_manager.cpp) every 800ms
 // until it settles, then fills #wifiScanResults. Picking an option copies
-// its SSID into the nearest wifiSsid text input -- it doesn't auto-submit,
-// so password entry (and, on renderConfigPage(), everything else on the
-// form) is unaffected.
+// its SSID into the nearest wifiSsid text input and reveals the Connect
+// button, which POSTs the current SSID+password to /wifi-scan/connect
+// (wifiConnectTo()) and polls /wifi-scan/connect-result until the device
+// reports connected/failed. Each saved-network row's own Connect button
+// (savedWifiNetworksHtml()) runs the same connect-result polling loop via
+// startConnect()/pollConnect(), but posts to /wifi-scan/connect-saved with
+// just the ssid, since the password is already known server-side. All of
+// this is independent of the page's own Save/"Save and continue" button --
+// Connect only touches Wi-Fi credentials, so trying a network doesn't
+// require (or risk) resubmitting the rest of the form.
 static String wifiScanScriptTag() {
   String html;
   html += "<script>(function(){";
@@ -117,7 +168,12 @@ static String wifiScanScriptTag() {
   html += "var status=document.getElementById('wifiScanStatus');";
   html += "var sel=document.getElementById('wifiScanResults');";
   html += "var ssidInput=document.querySelector(\"input[name='wifiSsid']\");";
+  html += "var passwordInput=document.querySelector(\"input[name='wifiPassword']\");";
+  html += "var connectBtn=document.getElementById('wifiConnectBtn');";
+  html += "var connectStatus=document.getElementById('wifiConnectStatus');";
   html += "var timer=null;";
+  html += "var connectTimer=null;";
+  html += "var activeConnectBtn=connectBtn;";
   html += "function poll(){";
   html += "fetch('/wifi-scan/result').then(function(r){return r.json();}).then(function(data){";
   html += "if(data.status==='scanning'){status.textContent='Scanning...';return;}";
@@ -125,6 +181,9 @@ static String wifiScanScriptTag() {
   html += "if(data.status==='done'&&data.networks&&data.networks.length){";
   html += "status.textContent='Found '+data.networks.length+' network(s).';";
   html += "sel.innerHTML='';";
+  html += "var ph=document.createElement('option');";
+  html += "ph.value='';ph.textContent='Select a network...';ph.disabled=true;ph.selected=true;";
+  html += "sel.appendChild(ph);";
   html += "data.networks.forEach(function(net){";
   html += "var opt=document.createElement('option');";
   html += "opt.value=net.ssid;";
@@ -137,9 +196,42 @@ static String wifiScanScriptTag() {
   html += "}";
   html += "btn.addEventListener('click',function(){";
   html += "btn.disabled=true;status.textContent='Scanning...';sel.style.display='none';";
+  html += "connectBtn.style.display='none';connectStatus.textContent='';";
   html += "fetch('/wifi-scan/start',{method:'POST'}).then(function(){timer=setInterval(poll,800);});";
   html += "});";
-  html += "sel.addEventListener('change',function(){if(sel.value)ssidInput.value=sel.value;});";
+  html += "sel.addEventListener('change',function(){";
+  html += "if(!sel.value)return;";
+  html += "ssidInput.value=sel.value;connectBtn.style.display='';connectStatus.textContent='';";
+  html += "passwordInput.focus();";
+  html += "});";
+  html += "function pollConnect(label){";
+  html += "fetch('/wifi-scan/connect-result').then(function(r){return r.json();}).then(function(data){";
+  html += "if(data.status==='connecting'){connectStatus.textContent='Connecting to '+label+'...';return;}";
+  html += "clearInterval(connectTimer);activeConnectBtn.disabled=false;";
+  html += "if(data.status==='connected'){connectStatus.textContent='Connected! IP: '+data.ip;}";
+  html += "else{connectStatus.textContent='Could not connect -- check the password and try again.';}";
+  html += "}).catch(function(){clearInterval(connectTimer);activeConnectBtn.disabled=false;connectStatus.textContent='Connect check failed.';});";
+  html += "}";
+  html += "function startConnect(btn,ssid,password){";
+  html += "activeConnectBtn=btn;btn.disabled=true;connectStatus.textContent='Connecting...';";
+  html += "var body='ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(password);";
+  html += "fetch('/wifi-scan/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})";
+  html += ".then(function(){clearInterval(connectTimer);connectTimer=setInterval(function(){pollConnect(ssid);},1000);pollConnect(ssid);})";
+  html += ".catch(function(){btn.disabled=false;connectStatus.textContent='Connect request failed.';});";
+  html += "}";
+  html += "connectBtn.addEventListener('click',function(){";
+  html += "if(!ssidInput.value)return;";
+  html += "startConnect(connectBtn,ssidInput.value,passwordInput.value);";
+  html += "});";
+  html += "document.querySelectorAll('.savedWifiConnectBtn').forEach(function(b){";
+  html += "b.addEventListener('click',function(){";
+  html += "var ssid=b.getAttribute('data-ssid');";
+  html += "activeConnectBtn=b;b.disabled=true;connectStatus.textContent='Connecting to '+ssid+' (saved password)...';";
+  html += "fetch('/wifi-scan/connect-saved',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)})";
+  html += ".then(function(){clearInterval(connectTimer);connectTimer=setInterval(function(){pollConnect(ssid);},1000);pollConnect(ssid);})";
+  html += ".catch(function(){b.disabled=false;connectStatus.textContent='Connect request failed.';});";
+  html += "});";
+  html += "});";
   html += "})();</script>";
   return html;
 }
@@ -210,7 +302,7 @@ static String renderConfigPage() {
   html += "small{color:#666;} code{background:#f3f3f3;padding:.1rem .3rem;border-radius:3px;}";
   html += "nav{margin-bottom:1rem;} nav a{margin-right:1rem;font-weight:600;text-decoration:none;color:#333;}";
   html += "</style></head><body>";
-  html += "<nav><a href='/'>Config</a><a href='/logs'>Logs</a></nav>";
+  html += "<nav><a href='/'>Config</a><a href='/firmware'>Firmware</a><a href='/logs'>Logs</a></nav>";
   html += "<h1>Stikka ESP32 Bridge</h1>";
   html += "<p class='sub'>Configure Wi-Fi, MQTT and ZPL target for this printer bridge.</p>";
 
@@ -352,6 +444,39 @@ static String renderConfigPage() {
   return html;
 }
 
+// OTA update over Wi-Fi (see handleOtaUpload()/handleOtaUpdate() below and
+// Update.h) -- same firmware.bin scripts/build-firmware.sh stages for the
+// in-browser USB flasher, just uploaded to the device directly instead of
+// over a cable. Own page (not a box on renderConfigPage()) for the same
+// reason Logs got its own page: it's an occasional admin action, not
+// something that belongs competing for space with day-to-day settings.
+static String renderFirmwarePage() {
+  String html;
+  html.reserve(2000);
+  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
+  html += "<title>Stikka ESP32 - Firmware</title><style>";
+  html += "body{font-family:Arial,sans-serif;max-width:640px;margin:1rem auto;padding:0 1rem;}";
+  html += "h1{margin-bottom:.25rem;} nav{margin-bottom:1rem;} nav a{margin-right:1rem;font-weight:600;text-decoration:none;color:#333;}";
+  html += "label{display:block;font-weight:600;margin-top:.75rem;} button{margin-top:1rem;padding:.6rem 1rem;width:auto;}";
+  html += ".box{border:1px solid #ddd;border-radius:8px;padding:1rem;margin-bottom:1rem;} small{color:#666;}";
+  html += "code{background:#f3f3f3;padding:.1rem .3rem;border-radius:3px;}";
+  html += "</style></head><body>";
+  html += "<nav><a href='/'>Config</a><a href='/firmware'>Firmware</a><a href='/logs'>Logs</a></nav>";
+  html += "<h1>Firmware</h1>";
+
+  html += "<div class='box'>";
+  html += "<small>Running build: " __DATE__ " " __TIME__ "</small>";
+  html += "<form method='POST' action='/update' enctype='multipart/form-data' style='margin-top:.5rem;'>";
+  html += "<input type='file' name='firmware' accept='.bin' required>";
+  html += "<button type='submit'>Upload &amp; reboot</button>";
+  html += "</form>";
+  html += "<small>Upload the <code>firmware.bin</code> produced by <code>scripts/build-firmware.sh</code> (staged under <code>frontend/public/firmware/</code> for the browser's USB flasher -- same file, just sent over Wi-Fi here instead of a cable). Not password-protected -- anyone who can reach this page can reflash the device, same as the other settings here.</small>";
+  html += "</div>";
+
+  html += "</body></html>";
+  return html;
+}
+
 static String renderLogsPage() {
   String html;
   html.reserve(4000);
@@ -364,7 +489,7 @@ static String renderLogsPage() {
   html += "font-size:.85rem;padding:.75rem;height:60vh;overflow-y:auto;white-space:pre-wrap;word-break:break-word;}";
   html += ".lvl-ERROR{color:#ff6b6b;} .lvl-WARN{color:#ffd166;} .lvl-INFO{color:#8ecae6;} .lvl-DEBUG{color:#999;}";
   html += "</style></head><body>";
-  html += "<nav><a href='/'>Config</a><a href='/logs'>Logs</a></nav>";
+  html += "<nav><a href='/'>Config</a><a href='/firmware'>Firmware</a><a href='/logs'>Logs</a></nav>";
   html += "<h1>Device Logs</h1>";
 
   html += "<div class='toolbar'>";
@@ -412,6 +537,10 @@ static void handleRoot() {
   web.send(200, "text/html", renderConfigPage());
 }
 
+static void handleFirmwarePage() {
+  web.send(200, "text/html", renderFirmwarePage());
+}
+
 static void handleCaptivePortal() {
   web.sendHeader("Cache-Control", "no-store, no-cache, must-revalidate");
   web.sendHeader("Pragma", "no-cache");
@@ -439,6 +568,7 @@ static void handleCaptivePortalRedirect() {
 static void handleWizardSave() {
   cfg.wifiSsid = web.arg("wifiSsid");
   cfg.wifiPassword = web.arg("wifiPassword");
+  rememberWifiNetwork(cfg.wifiSsid, cfg.wifiPassword);
   cfg.mqttHost = normalizeMqttHost(web.arg("mqttHost"));
   cfg.mqttPort = parsePort(web.arg("mqttPort"), 1883);
   cfg.mqttUseTls = web.hasArg("mqttUseTls");
@@ -525,9 +655,76 @@ static void handleChangeProtocol() {
   ESP.restart();
 }
 
+// POST /update -- the "Firmware" box's file upload (see renderConfigPage()).
+// Standard Arduino-ESP32 Update.h flow: WebServer streams the multipart
+// upload to this pair of handlers chunk-by-chunk via HTTPUpload, one status
+// transition at a time, rather than buffering the whole ~1MB file in RAM
+// first. otaError latches on the first failure so a bad UPLOAD_FILE_WRITE
+// doesn't get masked by a later status transition still reporting success.
+static bool otaSucceeded = false;
+static String otaError;
+
+static void handleOtaUpload() {
+  HTTPUpload& upload = web.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    otaSucceeded = false;
+    otaError = "";
+    dbgPrint("[ota] update started: ");
+    dbgPrintln(upload.filename, LogLevel::LOG_ERROR);
+    if (!Update.begin()) {
+      StreamString err;
+      Update.printError(err);
+      otaError = err;
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (!otaError.isEmpty()) return;
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      StreamString err;
+      Update.printError(err);
+      otaError = err;
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (otaError.isEmpty()) {
+      otaSucceeded = Update.end(/*evenIfRemaining=*/true);
+      if (!otaSucceeded) {
+        StreamString err;
+        Update.printError(err);
+        otaError = err;
+      }
+    }
+    if (otaSucceeded) {
+      dbgPrint("[ota] update succeeded, ");
+      dbgPrint(upload.totalSize);
+      dbgPrintln(" bytes written -- rebooting", LogLevel::LOG_ERROR);
+    } else {
+      dbgPrint("[ota] update FAILED: ");
+      dbgPrintln(otaError, LogLevel::LOG_ERROR);
+    }
+  } else if (upload.status == UPLOAD_FILE_ABORTED) {
+    Update.abort();
+    otaError = "upload aborted (connection dropped?)";
+    dbgPrintln("[ota] update aborted, connection dropped", LogLevel::LOG_ERROR);
+  }
+}
+
+static void handleOtaUpdate() {
+  if (otaSucceeded) {
+    web.send(200, "text/html",
+        "<!doctype html><meta http-equiv='refresh' content='4;url=/firmware'><body>Update applied. Rebooting&hellip; this page will reload shortly.</body>");
+    web.client().flush();
+    delay(250);
+    ESP.restart();
+    return;
+  }
+  web.send(200, "text/html",
+      "<!doctype html><body>Update failed: " + htmlEscape(otaError.isEmpty() ? String("no file received") : otaError) +
+      "<br>Nothing was changed -- the device is still running its current firmware.<br><a href='/firmware'>Back</a></body>");
+}
+
 static void handleSave() {
   cfg.wifiSsid = web.arg("wifiSsid");
   cfg.wifiPassword = web.arg("wifiPassword");
+  rememberWifiNetwork(cfg.wifiSsid, cfg.wifiPassword);
   cfg.mqttHost = normalizeMqttHost(web.arg("mqttHost"));
   cfg.mqttPort = parsePort(web.arg("mqttPort"), 1883);
   cfg.mqttUseTls = web.hasArg("mqttUseTls");
@@ -681,6 +878,48 @@ static void handleWifiScanResult() {
   web.send(200, "application/json", wifiScanResultJson());
 }
 
+static void handleWifiScanConnect() {
+  String ssid = web.arg("ssid");
+  if (ssid.isEmpty()) {
+    web.send(400, "text/plain", "ssid required");
+    return;
+  }
+  wifiConnectTo(ssid, web.arg("password"));
+  web.send(202, "text/plain", "connecting");
+}
+
+static void handleWifiConnectResult() {
+  web.send(200, "application/json", wifiConnectStatusJson());
+}
+
+// POST /wifi-scan/connect-saved -- the "Connect" button next to an entry in
+// the "Saved networks" list (see savedWifiNetworksHtml()). Takes only ssid;
+// the password is looked up server-side from cfg.savedWifiNetworks rather
+// than round-tripped through the browser, so a saved network's password
+// never has to appear in the page again once it's been entered once.
+static void handleWifiScanConnectSaved() {
+  String ssid = web.arg("ssid");
+  for (int i = 0; i < cfg.savedWifiNetworkCount; i++) {
+    if (cfg.savedWifiNetworks[i].ssid == ssid) {
+      wifiConnectTo(ssid, cfg.savedWifiNetworks[i].password);
+      web.send(202, "text/plain", "connecting");
+      return;
+    }
+  }
+  web.send(404, "text/plain", "not a saved network");
+}
+
+// POST /wifi-forget -- removes one entry from the "Saved networks" list.
+// Plain form POST + redirect (like /reconfigure's no-change branch and the
+// /logs/clear button) rather than fetch()+JS, since this is a rare,
+// low-frequency action that doesn't need live progress feedback the way
+// connecting does.
+static void handleWifiForget() {
+  forgetWifiNetwork(web.arg("ssid"));
+  web.sendHeader("Location", "/", true);
+  web.send(302, "text/plain", "");
+}
+
 void webUiSetup() {
   web.on("/", HTTP_GET, handleRoot);
   web.on("/generate_204", HTTP_GET, handleCaptivePortalRedirect);
@@ -692,8 +931,14 @@ void webUiSetup() {
   web.on("/setup", HTTP_POST, handleWizardSave);
   web.on("/save", HTTP_POST, handleSave);
   web.on("/reconfigure", HTTP_POST, handleChangeProtocol);
+  web.on("/firmware", HTTP_GET, handleFirmwarePage);
+  web.on("/update", HTTP_POST, handleOtaUpdate, handleOtaUpload);
   web.on("/wifi-scan/start", HTTP_POST, handleWifiScanStart);
   web.on("/wifi-scan/result", HTTP_GET, handleWifiScanResult);
+  web.on("/wifi-scan/connect", HTTP_POST, handleWifiScanConnect);
+  web.on("/wifi-scan/connect-result", HTTP_GET, handleWifiConnectResult);
+  web.on("/wifi-scan/connect-saved", HTTP_POST, handleWifiScanConnectSaved);
+  web.on("/wifi-forget", HTTP_POST, handleWifiForget);
   web.on("/logs", HTTP_GET, handleLogsPage);
   web.on("/logs.json", HTTP_GET, handleLogsJson);
   web.on("/logs/level", HTTP_POST, handleLogsSetLevel);

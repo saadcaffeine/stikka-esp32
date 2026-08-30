@@ -68,6 +68,13 @@ void loadConfig() {
   cfg.seikoDensity = prefs.getInt("seikoDens", 0x00);
   cfg.seikoSpeed = prefs.getInt("seikoSpd", 0x02);
   cfg.logLevel = (LogLevel)prefs.getUChar("logLvl", (uint8_t)LogLevel::LOG_INFO);
+  cfg.savedWifiNetworkCount = prefs.getInt("wNetCount", 0);
+  if (cfg.savedWifiNetworkCount < 0) cfg.savedWifiNetworkCount = 0;
+  if (cfg.savedWifiNetworkCount > MAX_SAVED_WIFI_NETWORKS) cfg.savedWifiNetworkCount = MAX_SAVED_WIFI_NETWORKS;
+  for (int i = 0; i < MAX_SAVED_WIFI_NETWORKS; i++) {
+    cfg.savedWifiNetworks[i].ssid = prefs.getString(("wNetS" + String(i)).c_str(), "");
+    cfg.savedWifiNetworks[i].password = prefs.getString(("wNetP" + String(i)).c_str(), "");
+  }
   prefs.end();
 }
 
@@ -110,7 +117,50 @@ void saveConfig() {
   prefs.putInt("seikoDens", cfg.seikoDensity);
   prefs.putInt("seikoSpd", cfg.seikoSpeed);
   prefs.putUChar("logLvl", (uint8_t)cfg.logLevel);
+  prefs.putInt("wNetCount", cfg.savedWifiNetworkCount);
+  for (int i = 0; i < MAX_SAVED_WIFI_NETWORKS; i++) {
+    prefs.putString(("wNetS" + String(i)).c_str(), cfg.savedWifiNetworks[i].ssid);
+    prefs.putString(("wNetP" + String(i)).c_str(), cfg.savedWifiNetworks[i].password);
+  }
   prefs.end();
+}
+
+void rememberWifiNetwork(const String& ssid, const String& password) {
+  if (ssid.isEmpty()) return;
+
+  for (int i = 0; i < cfg.savedWifiNetworkCount; i++) {
+    if (cfg.savedWifiNetworks[i].ssid == ssid) {
+      cfg.savedWifiNetworks[i].password = password;
+      saveConfig();
+      return;
+    }
+  }
+
+  if (cfg.savedWifiNetworkCount >= MAX_SAVED_WIFI_NETWORKS) {
+    for (int i = 1; i < MAX_SAVED_WIFI_NETWORKS; i++) {
+      cfg.savedWifiNetworks[i - 1] = cfg.savedWifiNetworks[i];
+    }
+    cfg.savedWifiNetworkCount = MAX_SAVED_WIFI_NETWORKS - 1;
+  }
+  cfg.savedWifiNetworks[cfg.savedWifiNetworkCount].ssid = ssid;
+  cfg.savedWifiNetworks[cfg.savedWifiNetworkCount].password = password;
+  cfg.savedWifiNetworkCount++;
+  saveConfig();
+}
+
+void forgetWifiNetwork(const String& ssid) {
+  for (int i = 0; i < cfg.savedWifiNetworkCount; i++) {
+    if (cfg.savedWifiNetworks[i].ssid == ssid) {
+      for (int j = i + 1; j < cfg.savedWifiNetworkCount; j++) {
+        cfg.savedWifiNetworks[j - 1] = cfg.savedWifiNetworks[j];
+      }
+      cfg.savedWifiNetworkCount--;
+      cfg.savedWifiNetworks[cfg.savedWifiNetworkCount].ssid = "";
+      cfg.savedWifiNetworks[cfg.savedWifiNetworkCount].password = "";
+      saveConfig();
+      return;
+    }
+  }
 }
 
 void printRuntimeSettings(const char* reason) {
@@ -174,6 +224,10 @@ void printRuntimeSettings(const char* reason) {
   dbgPrintln(cfg.wifiSsid.isEmpty() ? String("<not configured>") : cfg.wifiSsid);
   dbgPrint("Wi-Fi password set: ");
   dbgPrintln(cfg.wifiPassword.isEmpty() ? "no" : "yes");
+  dbgPrint("Saved Wi-Fi networks: ");
+  dbgPrint(cfg.savedWifiNetworkCount);
+  dbgPrint("/");
+  dbgPrintln(MAX_SAVED_WIFI_NETWORKS);
   dbgPrint("MQTT broker: ");
   if (cfg.mqttHost.isEmpty()) {
     dbgPrintln("<not configured>");

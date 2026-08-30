@@ -39,9 +39,27 @@ enum class LogLevel : uint8_t {
 const char* logLevelName(LogLevel level);
 LogLevel logLevelFromString(const String& raw, LogLevel fallback);
 
+static const int MAX_SAVED_WIFI_NETWORKS = 10;
+
+struct WifiNetwork {
+  String ssid;
+  String password;
+};
+
 struct AppConfig {
   String wifiSsid;
   String wifiPassword;
+  // Networks remembered via the web UI's WLAN scan "Connect" button (or the
+  // Wi-Fi fields on the Save/setup forms) -- up to MAX_SAVED_WIFI_NETWORKS,
+  // oldest evicted first once full (see rememberWifiNetwork() below).
+  // Independent of wifiSsid/wifiPassword above, which is just whichever
+  // network's credentials are currently active/shown in the form;
+  // connectWifi() (wifi_manager.cpp) only ever retries that one. This list
+  // exists so a previously-used network can be reconnected to from the web
+  // UI without retyping its password -- it is not automatic multi-AP
+  // failover.
+  WifiNetwork savedWifiNetworks[MAX_SAVED_WIFI_NETWORKS];
+  int savedWifiNetworkCount = 0;
   String mqttHost = DEFAULT_MQTT_HOST;
   uint16_t mqttPort = DEFAULT_MQTT_PORT;
   bool mqttUseTls = DEFAULT_MQTT_USE_TLS;
@@ -98,6 +116,16 @@ extern AppConfig cfg;
 
 void loadConfig();
 void saveConfig();
+
+// Adds ssid/password to cfg.savedWifiNetworks (or updates the password in
+// place if ssid is already saved) and persists immediately. Evicts the
+// oldest entry (index 0) once already at MAX_SAVED_WIFI_NETWORKS. No-op if
+// ssid is empty.
+void rememberWifiNetwork(const String& ssid, const String& password);
+
+// Removes ssid from cfg.savedWifiNetworks if present and persists it.
+// No-op if not found.
+void forgetWifiNetwork(const String& ssid);
 
 // True once the setup wizard's minimum viable fields are in place (printer
 // brand/method chosen, station Wi-Fi entered) -- gates whether web_ui.cpp

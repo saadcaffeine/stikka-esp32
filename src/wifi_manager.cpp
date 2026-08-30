@@ -19,8 +19,12 @@ static unsigned long wifiDisconnectedSinceMs = 0;
 static int lastWifiStatus = -1;
 static bool lastApModeState = false;
 
+static bool pendingConnectActive = false;
+static unsigned long pendingConnectStartedMs = 0;
+
 static const unsigned long WIFI_RETRY_EVERY_MS = 5000;
 static const unsigned long WIFI_FALLBACK_AP_AFTER_MS = 20000;
+static const unsigned long PENDING_CONNECT_TIMEOUT_MS = 15000;
 static const char* AP_PASSWORD = "stikkaesp32";
 static const uint16_t DNS_PORT = 53;
 // Overrides the ESP32 Arduino core's default soft-AP IP (192.168.4.1).
@@ -150,6 +154,17 @@ void wifiDisableFallbackAp() {
 }
 
 static void connectWifi() {
+  // A manual WLAN scan (wifiStartScan(), web UI) and a station connect/
+  // retry attempt can't safely share this single radio -- WiFi.begin()
+  // firing while esp_wifi_scan_start() is still in-flight can abort or
+  // corrupt the scan and leave the Wi-Fi stack flaky rather than just
+  // failing cleanly. Skip this iteration's reconnect bookkeeping entirely
+  // while a scan is running; wifiManagerLoop() calls this every loop()
+  // iteration (well under a second later), so it picks back up normally as
+  // soon as the scan completes -- at worst delaying a retry/fallback-AP
+  // check by however long the scan takes, not skipping it.
+  if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return;
+
   const unsigned long now = millis();
 
   if (cfg.wifiSsid.isEmpty()) {
@@ -230,7 +245,20 @@ void printNetworkState(const char* reason) {
 void wifiStartScan() {
   if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) return;
   WiFi.scanDelete();
-  WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false);
+  // Active scan (default), but with a longer per-channel dwell
+  // (max_ms_per_chan) than the library default of 300ms -- 300ms only
+  // reliably catches whichever APs happen to answer a probe request
+  // immediately, missing weaker/farther ones that would otherwise respond
+  // within a beacon interval or two. 600ms roughly doubles total scan time
+  // (~7-8s across the 2.4GHz channel set) but this already runs async and
+  // is polled from the web UI, so the extra time costs nothing but a longer
+  // "Scanning..." label. Note this can't fully compensate for the device's
+  // own fallback AP being active during the scan (WIFI_AP_STA, see
+  // ensureFallbackAp()) -- a single radio interleaving station scanning
+  // with AP beacon duty is inherently less thorough than a scan on a radio
+  // doing nothing else, and there's no way around that while a browser is
+  // relying on that same AP to reach this page.
+  WiFi.scanNetworks(/*async=*/true, /*show_hidden=*/false, /*passive=*/false, /*max_ms_per_chan=*/600);
 }
 
 String wifiScanResultJson() {
@@ -276,6 +304,66 @@ String wifiScanResultJson() {
       net["secure"] = WiFi.encryptionType(best) != WIFI_AUTH_OPEN;
     }
     WiFi.scanDelete();
+  }
+
+  String out;
+  serializeJson(doc, out);
+  return out;
+}
+
+// Deliberately doesn't touch the fallback AP. If the browser reached this
+// page via the AP (first-boot setup, no station network yet), tearing the
+// AP down here would cut the browser's own connection before it can see the
+// "connecting"/"failed" state below. connectWifi() already disables the AP
+// itself the moment it observes WL_CONNECTED (see the early branch above),
+// so a successful connect still ends up STA-only -- just not until the
+// browser has had a chance to see the result.
+void wifiConnectTo(const String& ssid, const String& password) {
+  cfg.wifiSsid = ssid;
+  cfg.wifiPassword = password;
+  // Persists cfg.wifiSsid/wifiPassword too (rememberWifiNetwork() ->
+  // saveConfig() writes the whole config), so no separate saveConfig() call
+  // is needed here.
+  rememberWifiNetwork(ssid, password);
+
+  pendingConnectActive = true;
+  pendingConnectStartedMs = millis();
+  // Reset so connectWifi()'s own bookkeeping (fallback-AP timer, retry
+  // throttle) restarts cleanly against this attempt rather than whatever was
+  // left over from the previous SSID.
+  wifiDisconnectedSinceMs = 0;
+
+  // Same hazard connectWifi() guards against: WiFi.begin() while a scan
+  // (wifiStartScan()) is still in-flight can corrupt the scan/radio state
+  // instead of failing cleanly. A user can hit this by starting a scan and
+  // then, before it finishes, clicking Connect on a *different*, always-
+  // visible control (a saved network's own Connect button, not the one tied
+  // to this scan's own results). cfg.wifiSsid/wifiPassword are already
+  // saved above, so just let connectWifi()'s normal retry loop pick this up
+  // -- lastWifiAttemptMs=0 makes it retry on the very next loop() iteration
+  // once the scan completes, rather than waiting a full WIFI_RETRY_EVERY_MS.
+  if (WiFi.scanComplete() == WIFI_SCAN_RUNNING) {
+    lastWifiAttemptMs = 0;
+    return;
+  }
+
+  lastWifiAttemptMs = millis();
+  WiFi.begin(ssid.c_str(), password.c_str());
+}
+
+String wifiConnectStatusJson() {
+  JsonDocument doc;
+  if (!pendingConnectActive) {
+    doc["status"] = "idle";
+  } else if (WiFi.status() == WL_CONNECTED) {
+    doc["status"] = "connected";
+    doc["ip"] = WiFi.localIP().toString();
+    pendingConnectActive = false;
+  } else if (millis() - pendingConnectStartedMs > PENDING_CONNECT_TIMEOUT_MS) {
+    doc["status"] = "failed";
+    pendingConnectActive = false;
+  } else {
+    doc["status"] = "connecting";
   }
 
   String out;

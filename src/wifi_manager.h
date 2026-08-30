@@ -39,3 +39,15 @@ void wifiStartScan();
 // sorted strongest-first, skipping hidden (empty-SSID) networks. Only
 // present when status=="done".
 String wifiScanResultJson();
+
+// Persists ssid/password as the station credentials and immediately attempts
+// to connect, bypassing connectWifi()'s normal WIFI_RETRY_EVERY_MS throttle.
+// Used by the web UI's "Connect" button next to the WLAN scan results
+// (POST /wifi-scan/connect, see web_ui.cpp) so picking a scanned network
+// actually joins it instead of only pre-filling the SSID field.
+void wifiConnectTo(const String& ssid, const String& password);
+
+// Polled by the web UI while a wifiConnectTo() attempt is in flight.
+// {"status":"idle|connecting|connected|failed","ip":"..."} -- "ip" present
+// only when connected. See wifi_manager.cpp for the exact "failed" cutoff.
+String wifiConnectStatusJson();
