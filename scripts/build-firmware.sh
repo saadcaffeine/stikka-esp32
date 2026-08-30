@@ -55,6 +55,28 @@ chip_family_for_env() {
   esac
 }
 
+# The ROM bootloader reads the second-stage bootloader header from a fixed,
+# chip-specific flash offset -- it's not something the app image or
+# partition table can override. ESP32/ESP32-S2 read it at 0x1000; every
+# newer chip (S3, C3, C6, H2, ...) reads it at 0x0. Flashing bootloader.bin
+# at the wrong offset leaves the real offset blank (0xFF erased flash), which
+# the ROM bootloader reports as "invalid header: 0xffffffff" in a reset loop.
+bootloader_offset_for_chip_family() {
+  local chip_family="$1"
+  case "$chip_family" in
+    ESP32|ESP32-S2) echo "4096" ;;
+    *) echo "0" ;;
+  esac
+}
+
+bootloader_offset_hex_for_chip_family() {
+  local chip_family="$1"
+  case "$chip_family" in
+    ESP32|ESP32-S2) echo "0x1000" ;;
+    *) echo "0x0" ;;
+  esac
+}
+
 for env_name in "${ENVS[@]}"; do
   echo "\n==> Building $env_name"
   pio run -d "$ESP32_DIR" -e "$env_name"
@@ -81,10 +103,12 @@ for env_name in "${ENVS[@]}"; do
   fi
 
   chip_family="$(chip_family_for_env "$env_name")"
+  bootloader_offset="$(bootloader_offset_for_chip_family "$chip_family")"
+  bootloader_offset_hex="$(bootloader_offset_hex_for_chip_family "$chip_family")"
 
   parts_json=''
   if [[ -f "$out_dir/bootloader.bin" ]]; then
-    parts_json+='      { "path": "bootloader.bin", "offset": 4096 },'
+    parts_json+="      { \"path\": \"bootloader.bin\", \"offset\": $bootloader_offset },"
     parts_json+=$'\n'
   fi
   if [[ -f "$out_dir/partitions.bin" ]]; then
@@ -118,7 +142,7 @@ EOF
   "env": "$env_name",
   "chipFamily": "$chip_family",
   "parts": [
-    { "path": "bootloader.bin", "offset": "0x1000", "optional": true },
+    { "path": "bootloader.bin", "offset": "$bootloader_offset_hex", "optional": true },
     { "path": "partitions.bin", "offset": "0x8000", "optional": true },
     { "path": "boot_app0.bin", "offset": "0xE000", "optional": true },
     { "path": "firmware.bin", "offset": "0x10000", "optional": false }
