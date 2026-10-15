@@ -20,3 +20,7 @@ void mqttBridgeSetup();
 void mqttBridgeLoop();
 
 void publishStatus(const char* phase = "ready", const char* lastError = "");
+
+// Per-job status on the status topic (not retained): accepted / queued /
+// printing / done / failed.
+void publishJobStatus(const char* jobId, const char* status, const char* message);

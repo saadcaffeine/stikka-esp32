@@ -42,6 +42,44 @@ bool targetSendString(const String& body, String& err) {
   return false;
 }
 
+// network/serial: no incremental API, so the whole (already time-bounded)
+// blocking send runs inside the first poll.
+static const uint8_t* blockingData = nullptr;
+static size_t blockingLen = 0;
+static bool blockingPending = false;
+
+bool targetSendBegin(const uint8_t* data, size_t len, String& err) {
+  if (cfg.printerMethod == "usb_host") return usbHostTargetSendBegin(data, len, err);
+  if (cfg.printerMethod != "network" && cfg.printerMethod != "serial") {
+    err = "printer connection method not configured yet (finish setup wizard)";
+    return false;
+  }
+  blockingData = data;
+  blockingLen = len;
+  blockingPending = true;
+  return true;
+}
+
+TargetSendState targetSendPoll(String& err) {
+  if (cfg.printerMethod == "usb_host") return usbHostTargetSendPoll(err);
+  if (!blockingPending) return TargetSendState::Done;
+  blockingPending = false;
+  return targetSend(blockingData, blockingLen, err) ? TargetSendState::Done : TargetSendState::Failed;
+}
+
+void targetSendProgress(size_t& sent, size_t& total) {
+  if (cfg.printerMethod == "usb_host") {
+    usbHostTargetSendProgress(sent, total);
+    return;
+  }
+  sent = blockingPending ? 0 : blockingLen;
+  total = blockingLen;
+}
+
+bool targetNeedsReboot() {
+  return cfg.printerMethod == "usb_host" && usbHostTargetNeedsReboot();
+}
+
 const char* targetMethodName() {
   // cfg is a persistent global, so cfg.printerMethod.c_str() is stable here
   // -- deliberately not a ternary mixing a String temporary with a literal,

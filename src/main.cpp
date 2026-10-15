@@ -3,6 +3,7 @@
 #include "config.h"
 #include "logging.h"
 #include "mqtt_bridge.h"
+#include "print_queue.h"
 #include "status_led.h"
 #include "targets/target.h"
 #include "web_ui.h"
@@ -37,5 +38,6 @@ void loop() {
   webUiLoop();
   mqttBridgeLoop();
   targetLoop();
+  printQueueLoop();
   updateStatusLed(wifiIsConnected(), mqttIsConnected());
 }

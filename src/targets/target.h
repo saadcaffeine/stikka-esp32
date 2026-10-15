@@ -16,6 +16,18 @@
 bool targetSend(const uint8_t* data, size_t len, String& err);
 bool targetSendString(const String& body, String& err);
 
+// Non-blocking send, driven by print_queue.cpp from loop(): Begin once, then
+// Poll every loop() pass until it returns Done or Failed (err set). `data`
+// must stay valid until then. The USB host method really is incremental
+// (one bulk transfer per poll, with per-chunk/idle/total timeouts); network
+// and serial do their existing bounded blocking send inside the first Poll.
+enum class TargetSendState : uint8_t { Running, Done, Failed };
+bool targetSendBegin(const uint8_t* data, size_t len, String& err);
+TargetSendState targetSendPoll(String& err);
+void targetSendProgress(size_t& sent, size_t& total);
+// True when the transport is wedged beyond recovery and only a reboot helps.
+bool targetNeedsReboot();
+
 // Human-readable transport identifier, mirrors cfg.printerMethod ("network"/
 // "serial"/"usb_host", or "unconfigured" before the setup wizard is done) --
 // used by the web UI and boot log.
@@ -60,6 +72,10 @@ void usbHostTargetSetup();
 void usbHostTargetLoop();
 bool usbHostTargetSend(const uint8_t* data, size_t len, String& err);
 bool usbHostTargetSendString(const String& body, String& err);
+bool usbHostTargetSendBegin(const uint8_t* data, size_t len, String& err);
+TargetSendState usbHostTargetSendPoll(String& err);
+void usbHostTargetSendProgress(size_t& sent, size_t& total);
+bool usbHostTargetNeedsReboot();
 
 // True once a USB printer has been enumerated and its bulk-OUT endpoint claimed
 // (used by the web UI status pill). Always false for non-usb_host setups.

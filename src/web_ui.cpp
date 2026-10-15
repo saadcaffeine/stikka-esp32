@@ -1,6 +1,8 @@
 #include "web_ui.h"
 
 #include <Update.h>
+#include <cstring>
+#include <new>
 #include <WebServer.h>
 #include <WiFi.h>
 #include <StreamString.h>
@@ -8,6 +10,7 @@
 #include "config.h"
 #include "logging.h"
 #include "mqtt_bridge.h"
+#include "print_queue.h"
 #include "targets/target.h"
 #include "test_print.h"
 #include "wifi_manager.h"
@@ -162,10 +165,13 @@ function pill(id,c,x){var p=$('#p-'+id);if(p){p.className='pill '+c+(p.dataset.l
 function status(){return fetch('/status.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
 pill('wifi',s.wifi?'ok':(s.ap?'wait':'bad'),s.wifi?'Wi-Fi '+s.ip:(s.ap?'Setup AP':'Wi-Fi off'));
 pill('mqtt',s.mqtt?'ok':'bad',s.mqtt?'MQTT on':'MQTT off');
-pill('prn',s.printer==='ready'?'ok':(s.printer==='missing'?'bad':'wait'),s.printer==='ready'?'Printer ready':(s.printer==='missing'?'No printer':'Printer: '+s.method));
+if(s.job==='printing')pill('prn','wait','Printing'+(s.pct>=0?' '+s.pct+'%':'')+(s.queue?' (+'+s.queue+' queued)':''));
+else if(s.last_error)pill('prn','bad','Last print failed');
+else pill('prn',s.printer==='ready'?'ok':(s.printer==='missing'?'bad':'wait'),s.printer==='ready'?'Printer ready':(s.printer==='missing'?'No printer':'Printer: '+s.method));
+var pp=$('#p-prn');if(pp)pp.title=s.last_error||'';
 return s;}).catch(function(){pill('wifi','bad','Device offline');pill('mqtt','wait','MQTT -');pill('prn','wait','Printer -');return null;});}
 window.refreshStatus=status;
-(function loop(){setTimeout(function(){if(document.hidden)return loop();status().then(loop);},5000);})();
+(function loop(ms){setTimeout(function(){if(document.hidden)return loop(5000);status().then(function(s){loop(s&&s.job==='printing'?1500:5000);});},ms||5000);})();
 function waitOnline(n){n=n||0;setTimeout(function(){status().then(function(s){
 if(s&&s.wifi){toast('Device online','ok');setTimeout(function(){location.reload()},900);}
 else if(n<40)waitOnline(n+1);
@@ -280,7 +286,9 @@ static String statusPillsHtml() {
   else h += pillHtml("wifi", "bad", "Wi-Fi off");
   h += pillHtml("mqtt", mqttIsConnected() ? "ok" : "bad", mqttIsConnected() ? "MQTT on" : "MQTT off");
   const String ps = printerState();
-  if (ps == "ready") h += pillHtml("prn", "ok", "Printer ready");
+  if (printQueueBusy()) h += pillHtml("prn", "wait", "Printing");
+  else if (!printQueueLastError().isEmpty()) h += pillHtml("prn", "bad", "Last print failed");
+  else if (ps == "ready") h += pillHtml("prn", "ok", "Printer ready");
   else if (ps == "missing") h += pillHtml("prn", "bad", "No printer");
   else h += pillHtml("prn", "wait", "Printer: " + String(targetMethodName()));
   h += "</div>";
@@ -475,7 +483,7 @@ static String renderConfigPage() {
   // Test print is an action, not a setting: its own button, own states.
   html += cardOpen("prn", "Test print");
   html += "<small style='margin:0'>Sends a small test label using the current saved settings.</small>";
-  html += "<button type='button' class='btn teal block' data-post='/test' data-busy='Sending...' data-ok='Test sent'>Send test print</button>";
+  html += "<button type='button' class='btn teal block' data-post='/test' data-busy='Queueing...' data-ok='Queued'>Send test print</button>";
   html += "</section>";
 
   html += "<form method='POST' action='/save' data-ajax data-busy='Saving...'>";
@@ -611,7 +619,15 @@ static void handleStatusJson() {
   j += ",\"mqtt\":";
   j += mqttIsConnected() ? "true" : "false";
   j += ",\"printer\":\"" + printerState() + "\"";
-  j += ",\"method\":\"" + String(targetMethodName()) + "\"}";
+  j += ",\"method\":\"" + String(targetMethodName()) + "\"";
+  j += ",\"job\":\"";
+  j += printQueueBusy() ? "printing" : "idle";
+  j += "\",\"pct\":" + String(printQueueProgressPct());
+  j += ",\"queue\":" + String((unsigned long)printQueueWaiting());
+  String le = printQueueLastError();
+  le.replace("\\", "\\\\");
+  le.replace("\"", "\\\"");
+  j += ",\"last_error\":\"" + le + "\"}";
   web.sendHeader("Cache-Control", "no-store");
   web.send(200, "application/json", j);
 }
@@ -894,14 +910,15 @@ static void handleSave() {
   wifiDisableFallbackAp();
 }
 
+// POST /test -- queues a firmware-built test label through the same print
+// queue as MQTT jobs, so it can't collide with a job already being sent and
+// never blocks the web server. Progress shows in the Printer status pill.
 static void handleTest() {
+  std::unique_ptr<uint8_t[]> bytes;
+  size_t len = 0;
   if (cfg.printerProtocol == "ql" || cfg.printerProtocol == "seiko") {
     // No client-supplied image exists for a firmware-triggered test print,
-    // so this builds a small synthetic striped raster (see test_print.cpp)
-    // instead of the raw ZPL string the zpl branch below sends -- same
-    // wire framing a real job would use, just placeholder row content.
-    std::unique_ptr<uint8_t[]> bytes;
-    size_t len = 0;
+    // so this builds a small synthetic striped raster (see test_print.cpp).
     const bool built = (cfg.printerProtocol == "ql")
         ? buildQlTestPrintBytes(bytes, len)
         : buildSeikoTestPrintBytes(bytes, len);
@@ -909,27 +926,24 @@ static void handleTest() {
       web.send(500, "text/plain", "test failed: could not build test pattern (out of memory)");
       return;
     }
-    String err;
-    const bool ok = targetSend(bytes.get(), len, err);
-    if (!ok) {
-      dbgPrintln("[test] test print failed: " + err, LogLevel::LOG_ERROR);
-      web.send(500, "text/plain", "test failed: " + err);
+  } else {
+    static const char kZpl[] = "^XA^CF0,30^FO40,40^FDStikka ESP32 test^FS^XZ";
+    len = sizeof(kZpl) - 1;
+    bytes.reset(new (std::nothrow) uint8_t[len]);
+    if (!bytes) {
+      web.send(500, "text/plain", "test failed: out of memory");
       return;
     }
-    dbgPrintln("[test] test label sent", LogLevel::LOG_INFO);
-    web.send(200, "text/plain", "test label sent");
-    return;
+    memcpy(bytes.get(), kZpl, len);
   }
   String err;
-  const String zpl = "^XA^CF0,30^FO40,40^FDStikka ESP32 test^FS^XZ";
-  const bool ok = targetSendString(zpl, err);
-  if (!ok) {
-    dbgPrintln("[test] test print failed: " + err, LogLevel::LOG_ERROR);
-    web.send(500, "text/plain", "test failed: " + err);
+  if (!printQueueEnqueue("web-test-" + String(millis()), "test", std::move(bytes), len, err)) {
+    dbgPrintln("[test] not queued: " + err, LogLevel::LOG_WARN);
+    web.send(503, "text/plain", err);
     return;
   }
-  dbgPrintln("[test] test label sent", LogLevel::LOG_INFO);
-  web.send(200, "text/plain", "test label sent");
+  dbgPrintln("[test] test label queued", LogLevel::LOG_INFO);
+  web.send(200, "text/plain", "Test label queued. The Printer pill shows progress.");
 }
 
 static void handleLogsPage() {

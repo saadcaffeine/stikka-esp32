@@ -11,6 +11,7 @@
 #include "config.h"
 #include "logging.h"
 #include "status_led.h"
+#include "print_queue.h"
 #include "targets/target.h"
 
 // Two concrete client instances (transport is baked into the type, unlike
@@ -217,7 +218,7 @@ void publishStatus(const char* phase, const char* lastError) {
   }
 }
 
-static void publishJobStatus(const char* jobId, const char* status, const char* message) {
+void publishJobStatus(const char* jobId, const char* status, const char* message) {
   if (!activeMqtt || !activeMqtt->connected()) return;
   markLedEvent(LedEventType::tx);
 
@@ -238,6 +239,16 @@ static void publishJobStatus(const char* jobId, const char* status, const char* 
   const uint16_t packetId = activeMqtt->publish(statusTopic().c_str(), 0, false, payload.c_str());
   if (packetId == 0) {
     dbgPrintln("[mqtt] publish job status failed (not connected or out of memory)", LogLevel::LOG_WARN);
+  }
+}
+
+// Hands a decoded job to print_queue.cpp, which sends it from loop() without
+// blocking MQTT, the web UI or later jobs, and publishes printing/done/failed.
+static void queueJob(const char* jobId, const char* tag, std::unique_ptr<uint8_t[]> bytes, size_t len) {
+  String err;
+  if (!printQueueEnqueue(jobId, tag, std::move(bytes), len, err)) {
+    dbgPrintln("[" + String(tag) + "] job not queued: " + err, LogLevel::LOG_WARN);
+    publishJobStatus(jobId, "failed", err.c_str());
   }
 }
 
@@ -321,7 +332,6 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
   dbgPrint(", encoding=");
   dbgPrintln(payloadEncoding);
 
-  publishStatus("printing", "");
   publishJobStatus(jobId, "accepted", "job accepted");
 
   if (String(payloadType) == "zpl") {
@@ -346,13 +356,11 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
       return;
     }
 
-    String sendErr;
-    bool ok = false;
+    std::unique_ptr<uint8_t[]> bytes;
+    size_t decodedLen = 0;
     if (zplIsBase64) {
       dbgPrint("[zpl] decoding base64 bytes=");
       dbgPrintln(zplBody.length());
-      std::unique_ptr<uint8_t[]> bytes;
-      size_t decodedLen = 0;
       String decodeErr;
       if (!decodeBase64Payload(zplBody, bytes, decodedLen, decodeErr)) {
         dbgPrintln("[zpl] decode failed: " + decodeErr, LogLevel::LOG_ERROR);
@@ -360,31 +368,22 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
         publishStatus("error", decodeErr.c_str());
         return;
       }
-      dbgPrint("[zpl] sending decoded bytes=");
-      dbgPrintln(decodedLen);
       dbgPrintln("[zpl] ---- ZPL BODY (head/tail) ----");
       dbgPrintHeadTailBytes(bytes.get(), decodedLen);
       dbgPrintln("[zpl] ---- ZPL BODY END ----");
-      ok = targetSend(bytes.get(), decodedLen, sendErr);
     } else {
-      dbgPrint("[zpl] sending utf8 bytes=");
-      dbgPrintln(zplBody.length());
       dbgPrintln("[zpl] ---- ZPL BODY (head/tail) ----");
       dbgPrintHeadTail(zplBody);
       dbgPrintln("[zpl] ---- ZPL BODY END ----");
-      ok = targetSendString(zplBody, sendErr);
+      decodedLen = zplBody.length();
+      bytes.reset(new (std::nothrow) uint8_t[decodedLen ? decodedLen : 1]);
+      if (!bytes) {
+        publishJobStatus(jobId, "failed", "esp32 out of memory for zpl job");
+        return;
+      }
+      memcpy(bytes.get(), zplBody.c_str(), decodedLen);
     }
-    if (!ok) {
-      dbgPrint("[zpl] send failed: ");
-      dbgPrintln(sendErr, LogLevel::LOG_ERROR);
-      publishJobStatus(jobId, "failed", sendErr.c_str());
-      publishStatus("error", sendErr.c_str());
-      return;
-    }
-
-    dbgPrintln("[zpl] job sent to target successfully", LogLevel::LOG_INFO);
-    publishJobStatus(jobId, "done", "zpl sent");
-    publishStatus("ready", "");
+    queueJob(jobId, "zpl", std::move(bytes), decodedLen);
     return;
   }
 
@@ -430,19 +429,7 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
 
     dbgPrint("[image] decoded bytes=");
     dbgPrintln(decodedLen);
-    String sendErr;
-    dbgPrintln("[image] sending decoded image to target");
-    if (!targetSend(bytes.get(), decodedLen, sendErr)) {
-      dbgPrint("[image] send failed: ");
-      dbgPrintln(sendErr, LogLevel::LOG_ERROR);
-      publishJobStatus(jobId, "failed", sendErr.c_str());
-      publishStatus("error", sendErr.c_str());
-      return;
-    }
-
-    dbgPrintln("[image] job sent to target successfully", LogLevel::LOG_INFO);
-    publishJobStatus(jobId, "done", "image bytes sent");
-    publishStatus("ready", "");
+    queueJob(jobId, "image", std::move(bytes), decodedLen);
     return;
   }
 
@@ -474,17 +461,7 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
       return;
     }
 
-    String sendErr;
-    if (!targetSend(bytes.get(), decodedLen, sendErr)) {
-      dbgPrintln("[ql] send failed: " + sendErr, LogLevel::LOG_ERROR);
-      publishJobStatus(jobId, "failed", sendErr.c_str());
-      publishStatus("error", sendErr.c_str());
-      return;
-    }
-
-    dbgPrintln("[ql] job sent to target successfully", LogLevel::LOG_INFO);
-    publishJobStatus(jobId, "done", "ql raster bytes sent");
-    publishStatus("ready", "");
+    queueJob(jobId, "ql", std::move(bytes), decodedLen);
     return;
   }
 
@@ -516,17 +493,7 @@ static void onMqttMessage(const espMqttClientTypes::MessageProperties& propertie
       return;
     }
 
-    String sendErr;
-    if (!targetSend(bytes.get(), decodedLen, sendErr)) {
-      dbgPrintln("[seiko] send failed: " + sendErr, LogLevel::LOG_ERROR);
-      publishJobStatus(jobId, "failed", sendErr.c_str());
-      publishStatus("error", sendErr.c_str());
-      return;
-    }
-
-    dbgPrintln("[seiko] job sent to target successfully", LogLevel::LOG_INFO);
-    publishJobStatus(jobId, "done", "seiko raster bytes sent");
-    publishStatus("ready", "");
+    queueJob(jobId, "seiko", std::move(bytes), decodedLen);
     return;
   }
 
@@ -639,7 +606,7 @@ void mqttBridgeLoop() {
   const unsigned long now = millis();
   const unsigned long intervalMs = (unsigned long)cfg.statusIntervalSec * 1000UL;
   if (now - lastStatusMs > intervalMs) {
-    publishStatus("ready", "");
+    publishStatus(printQueueBusy() ? "printing" : "ready", "");
     lastStatusMs = now;
   }
 }

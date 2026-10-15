@@ -20,7 +20,7 @@ Fork of [stikka-factory/stikka-esp32](https://github.com/stikka-factory/stikka-e
 
 Open `http://<printer-name>.local/` (or the board's IP). On a fresh board, join its `Stikka-XXXXXX` network (password `stikkaesp32`) and a setup page opens. The interface is designed for phones.
 
-- **Header:** three live pills, always visible: Wi-Fi (with IP), MQTT, and Printer (ready / no printer; USB printers only). They refresh every 5 seconds and show "Device offline" if the board stops answering.
+- **Header:** three live pills, always visible: Wi-Fi (with IP), MQTT, and Printer (ready / no printer / printing with progress / last print failed). They refresh every 5 seconds and show "Device offline" if the board stops answering.
 - **Config:** device summary, a test print button, then Wi-Fi, printer, label, MQTT and debug settings, with a Save bar at the bottom. Changing the printer type (which reboots the board) is in its own red card.
 - **Firmware:** upload a `firmware.bin` over Wi-Fi, with a progress bar. The page waits for the reboot and reloads.
 - **Logs:** live device log with level selector, pause and clear.
@@ -39,6 +39,7 @@ See [CHANGELOG.md](CHANGELOG.md) for details.
 
 - **Fixed:** Save and "Save and continue" silently did nothing as soon as one Wi-Fi network was saved, so printer and label settings could not be saved. Cause: the Forget button was a nested form, which HTML forbids.
 - **Redesigned web UI:** mobile-first, colour-coded, live status pills, button states, in-page save/test/scan/connect.
+- **Failed prints time out gracefully:** jobs are queued and sent without blocking MQTT or the web UI. A printer that stops taking data fails that job after about 10 s, and the next job still prints; the old "`0x10c` until reboot" state is fixed.
 - **New:** `/status.json` endpoint and printer-ready detection for USB printers.
 - **Fixed:** Wi-Fi names containing an apostrophe broke the page markup.
 
@@ -61,7 +62,9 @@ Settings live in the board's flash (NVS) and survive reflashing.
 ## Troubleshooting
 
 - **Job received but the printer only blinks or nothing prints:** check the printer and frontend setup first. For a Brother QL-500/550, enable legacy mode in the frontend (see the [stikka-mqtt README](https://github.com/saadcaffeine/stikka-mqtt#brother-ql-500--ql-550-legacy-raster-mode)).
-- **Log shows `0x10c` on USB send:** a USB transfer timed out and left the host stack in a stuck state. Reboot the board. (Known limitation: the firmware does not recover on its own yet.)
+- **"Printer stopped accepting data":** the printer took no data for 10 s (out of labels, cover open, wrong roll, or a QL-500 sent the newer command set). The job is failed and the next one in the queue starts; fix the printer and print again.
+- **"Printer busy: 4 jobs already waiting":** the queue is full, usually because the printer is stuck. Each stuck job gives up after about 12 s.
+- **Bridge rebooted after a failed print:** the USB stack got stuck beyond recovery, so the bridge failed the queued jobs and restarted itself. Settings are kept.
 - **No "Printer ready" pill:** the printer isn't enumerated. Check the cable, that the printer is on, and that the board's native USB port is used (not COM).
 
 ## More detail
