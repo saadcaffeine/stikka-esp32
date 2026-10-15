@@ -108,8 +108,8 @@ static String printerTypeFieldHtml() {
 // handleWizardSave()/handleSave()/handleWifiScanConnect() above). Each row's
 // own "Connect" POSTs just the ssid to /wifi-scan/connect-saved, which looks
 // the password up server-side, so a saved password never has to appear in
-// the page again. "Forget" is a plain form POST + redirect, not fetch()+JS,
-// since it's rare enough not to need live feedback.
+// the page again. "Forget" POSTs just the ssid to /wifi-forget via fetch()
+// and reloads the page (it can't be a nested <form>, see below).
 static String savedWifiNetworksHtml() {
   if (cfg.savedWifiNetworkCount <= 0) return String();
   String html;
@@ -120,10 +120,15 @@ static String savedWifiNetworksHtml() {
     html += "<div style='display:flex;align-items:center;gap:.4rem;margin-top:.3rem;'>";
     html += "<span style='flex:1;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>" + escaped + "</span>";
     html += "<button type='button' class='savedWifiConnectBtn' data-ssid='" + escaped + "' style='width:auto;margin-top:0;padding:.25rem .6rem;'>Connect</button>";
-    html += "<form method='POST' action='/wifi-forget' style='margin:0;'>";
-    html += "<input type='hidden' name='ssid' value='" + escaped + "'>";
-    html += "<button type='submit' style='width:auto;margin-top:0;padding:.25rem .6rem;'>Forget</button>";
-    html += "</form>";
+    // A script-driven type='button' (see wifiScanScriptTag()), not a nested
+    // <form>: this list is rendered inside the page's big /save (or /setup)
+    // <form>, and HTML forbids nested forms -- the browser closes the outer
+    // form at the first inner </form>, leaving the real Save button (and
+    // every field after the Wi-Fi box) outside any form, so Save silently did
+    // nothing whenever a saved network existed. It must not be a submit
+    // button either: Enter in any text field would then trigger the first
+    // Forget button instead of Save.
+    html += "<button type='button' class='savedWifiForgetBtn' data-ssid='" + escaped + "' style='width:auto;margin-top:0;padding:.25rem .6rem;'>Forget</button>";
     html += "</div>";
   }
   html += "</div>";
@@ -230,6 +235,14 @@ static String wifiScanScriptTag() {
   html += "fetch('/wifi-scan/connect-saved',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)})";
   html += ".then(function(){clearInterval(connectTimer);connectTimer=setInterval(function(){pollConnect(ssid);},1000);pollConnect(ssid);})";
   html += ".catch(function(){b.disabled=false;connectStatus.textContent='Connect request failed.';});";
+  html += "});";
+  html += "});";
+  html += "document.querySelectorAll('.savedWifiForgetBtn').forEach(function(b){";
+  html += "b.addEventListener('click',function(){";
+  html += "b.disabled=true;";
+  html += "fetch('/wifi-forget',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(b.getAttribute('data-ssid'))})";
+  html += ".then(function(){location.reload();})";
+  html += ".catch(function(){b.disabled=false;});";
   html += "});";
   html += "});";
   html += "})();</script>";
