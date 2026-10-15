@@ -23,6 +23,7 @@ static String htmlEscape(const String& in) {
     else if (c == '<') out += "&lt;";
     else if (c == '>') out += "&gt;";
     else if (c == '"') out += "&quot;";
+    else if (c == '\'') out += "&#39;";
     else out += c;
   }
   return out;
@@ -80,10 +81,277 @@ static bool printerTypeFromValue(const String& value, String& protocolOut, Strin
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// Shared look & feel. Mobile-first, no external assets, no frameworks: one
+// small stylesheet + one small script inlined into every page (so it also
+// works from the captive-portal fallback AP with no internet). Colour carries
+// meaning: blue = Wi-Fi, violet = MQTT, teal = printer, amber = label/caution,
+// slate = device/debug, red = destructive. Buttons visibly change state
+// (idle -> busy spinner -> done / failed) via btn() in kJs, and the header
+// pills poll /status.json so connection state is always on screen.
+// ---------------------------------------------------------------------------
+static const char kCss[] = R"CSS(
+:root{--bg:#f1f5f9;--ink:#0f172a;--mute:#64748b;--line:#e2e8f0;--blue:#2563eb;--green:#16a34a;--amber:#d97706;--red:#dc2626;--violet:#7c3aed;--teal:#0d9488;--slate:#475569}
+*{box-sizing:border-box}[hidden]{display:none!important}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{position:sticky;top:0;z-index:5;background:#0f172a;color:#fff;padding:.6rem 1rem .7rem}
+.top{display:flex;align-items:baseline;justify-content:space-between;gap:.5rem}
+.top b{font-size:1.05rem}.top span{color:#94a3b8;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+nav{display:flex;gap:.3rem;margin-top:.5rem}
+nav a{flex:1;text-align:center;padding:.4rem 0;border-radius:8px;color:#cbd5e1;text-decoration:none;font-weight:600;font-size:.9rem}
+nav a.on{background:#334155;color:#fff}
+.pills{display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.55rem}
+.pill{display:inline-flex;align-items:center;gap:.4rem;font-size:.75rem;padding:.15rem .6rem;border-radius:99px;background:#1e293b;color:#e2e8f0}
+.pill i{width:.55rem;height:.55rem;border-radius:50%;background:#64748b;flex:none}
+.pill.ok i{background:#22c55e}.pill.wait i{background:#f59e0b}.pill.bad i{background:#ef4444}
+.pill.lt{background:#e2e8f0;color:var(--ink)}
+main{max-width:720px;margin:0 auto;padding:1rem 1rem 6.5rem}
+h1{font-size:1.3rem;margin:.2rem 0}.sub{color:var(--mute);margin:0 0 1rem;font-size:.9rem}
+.card{background:#fff;border:1px solid var(--line);border-top:4px solid var(--c,var(--slate));border-radius:12px;padding:1rem;margin-bottom:1rem}
+.card h2{font-size:1rem;margin:0 0 .25rem;color:var(--c,var(--slate))}
+.card h3{font-size:.85rem;margin:1rem 0 .1rem;color:var(--mute)}
+.wifi{--c:var(--blue)}.mqtt{--c:var(--violet)}.prn{--c:var(--teal)}.lbl{--c:var(--amber)}.dev{--c:var(--slate)}.danger{--c:var(--red)}
+label{display:block;font-weight:600;font-size:.88rem;margin-top:.85rem}
+input,select,textarea{display:block;width:100%;margin-top:.3rem;padding:.65rem .7rem;font:inherit;font-weight:400;color:inherit;background:#fff;border:1px solid #cbd5e1;border-radius:8px}
+input:focus,select:focus,textarea:focus{outline:2px solid var(--c,var(--blue));outline-offset:1px;border-color:transparent}
+label.chk{display:flex;gap:.6rem;align-items:flex-start;font-weight:500}
+label.chk input{width:1.15rem;height:1.15rem;margin:.2rem 0 0;flex:none}
+small{display:block;color:var(--mute);font-size:.8rem;margin-top:.4rem}
+small:empty{display:none}
+code{background:#f1f5f9;padding:.05rem .3rem;border-radius:4px;font-size:.85em;word-break:break-all}
+a{color:var(--blue)}
+.kv{display:flex;justify-content:space-between;gap:1rem;padding:.4rem 0;border-bottom:1px solid var(--line);font-size:.9rem}
+.kv:last-child{border:0}.kv span{color:var(--mute);flex:none}.kv b{font-weight:600;text-align:right;word-break:break-word}
+.row{display:flex;gap:.5rem;flex-wrap:wrap;margin-top:.7rem}
+.cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(7.5rem,1fr));gap:.6rem}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:.5rem;min-height:2.8rem;padding:.5rem 1rem;border:0;border-radius:10px;font:inherit;font-weight:600;color:#fff;background:var(--b,var(--blue));cursor:pointer;transition:background .15s,transform .05s}
+.btn:hover{filter:brightness(1.08)}.btn:active{transform:scale(.98)}
+.btn.block{width:100%;margin-top:.8rem}.btn.sm{min-height:2.1rem;padding:.2rem .75rem;font-size:.85rem;border-radius:8px}
+.btn.green{--b:var(--green)}.btn.amber{--b:var(--amber)}.btn.red{--b:var(--red)}.btn.slate{--b:var(--slate)}.btn.teal{--b:var(--teal)}
+.btn.ghost{background:transparent;color:var(--b,var(--blue));box-shadow:inset 0 0 0 2px var(--b,var(--blue))}
+.btn:disabled{cursor:not-allowed;opacity:.55;filter:grayscale(.5)}
+.btn.busy,.btn.ok,.btn.err{background:var(--b);color:#fff;box-shadow:none;opacity:1;filter:none}
+.btn.busy{--b:var(--slate);cursor:progress}.btn.ok{--b:var(--green)}.btn.err{--b:var(--red)}
+.btn.busy::before{content:"";width:1em;height:1em;border:2px solid #fff6;border-top-color:#fff;border-radius:50%;animation:sp .8s linear infinite}
+@keyframes sp{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){.btn.busy::before{animation:none}}
+.net{display:flex;align-items:center;gap:.4rem;padding:.4rem 0;border-bottom:1px solid var(--line)}
+.net span{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:.9rem}
+.bar{position:fixed;left:0;right:0;bottom:0;z-index:5;background:#fff;border-top:1px solid var(--line);padding:.6rem 1rem calc(.6rem + env(safe-area-inset-bottom))}
+.bar div{max-width:720px;margin:0 auto;display:flex;gap:.8rem;align-items:center}
+.bar .btn{--b:var(--slate);flex:1}.bar.dirty .btn{--b:var(--green)}
+.bar .btn.busy{--b:var(--slate)}.bar .btn.ok{--b:var(--green)}.bar .btn.err{--b:var(--red)}
+.dirty-t{font-size:.8rem;color:var(--mute);flex:none;max-width:40%}.bar.dirty .dirty-t{color:var(--amber);font-weight:600}
+#toast{position:fixed;left:1rem;right:1rem;bottom:5rem;max-width:688px;margin:0 auto;padding:.7rem 1rem;border-radius:10px;color:#fff;background:var(--slate);font-size:.9rem;display:none;z-index:6;box-shadow:0 4px 14px #0003;word-break:break-word}
+#toast.show{display:block}#toast.ok{background:var(--green)}#toast.err{background:var(--red)}#toast.wait{background:var(--amber)}
+progress{width:100%;height:.7rem;margin-top:.8rem;accent-color:var(--amber)}
+.tools{display:flex;gap:.8rem;align-items:center;flex-wrap:wrap}.tools label{margin:0;display:flex;align-items:center;gap:.4rem;font-weight:500}.tools input,.tools select{width:auto;margin:0}
+#log{background:#0f172a;color:#cbd5e1;border-radius:12px;padding:.75rem;height:62vh;overflow-y:auto;font:.8rem/1.45 ui-monospace,Consolas,Menlo,monospace;white-space:pre-wrap;word-break:break-word}
+.lvl-ERROR{color:#f87171}.lvl-WARN{color:#fbbf24}.lvl-INFO{color:#7dd3fc}.lvl-DEBUG{color:#94a3b8}
+)CSS";
+
+static const char kJs[] = R"JS(
+var $=function(s){return document.querySelector(s)};
+function btn(b,s,t){if(!b)return;if(!b.dataset.l)b.dataset.l=b.textContent;clearTimeout(b._t);
+b.classList.remove('busy','ok','err');
+if(s==='idle'){b.disabled=false;b.textContent=b.dataset.l;return;}
+b.classList.add(s);b.disabled=(s==='busy');b.textContent=t||b.dataset.l;
+if(s!=='busy')b._t=setTimeout(function(){btn(b,'idle')},2500);}
+var tt;function toast(m,k){var t=$('#toast');if(!t)return;t.textContent=m;t.className='show '+(k||'');clearTimeout(tt);if(k!=='wait')tt=setTimeout(function(){t.className=''},6000);}
+function pill(id,c,x){var p=$('#p-'+id);if(p){p.className='pill '+c+(p.dataset.lt?' lt':'');p.lastChild.textContent=x;}}
+function status(){return fetch('/status.json',{cache:'no-store'}).then(function(r){return r.json()}).then(function(s){
+pill('wifi',s.wifi?'ok':(s.ap?'wait':'bad'),s.wifi?'Wi-Fi '+s.ip:(s.ap?'Setup AP':'Wi-Fi off'));
+pill('mqtt',s.mqtt?'ok':'bad',s.mqtt?'MQTT on':'MQTT off');
+pill('prn',s.printer==='ready'?'ok':(s.printer==='missing'?'bad':'wait'),s.printer==='ready'?'Printer ready':(s.printer==='missing'?'No printer':'Printer: '+s.method));
+return s;}).catch(function(){pill('wifi','bad','Device offline');pill('mqtt','wait','MQTT -');pill('prn','wait','Printer -');return null;});}
+window.refreshStatus=status;
+(function loop(){setTimeout(function(){if(document.hidden)return loop();status().then(loop);},5000);})();
+function waitOnline(n){n=n||0;setTimeout(function(){status().then(function(s){
+if(s&&s.wifi){toast('Device online','ok');setTimeout(function(){location.reload()},900);}
+else if(n<40)waitOnline(n+1);
+else toast('Device not reachable here. If Wi-Fi changed, open its new address or its .local name.','err');});},1500);}
+var bar=$('.bar');function dirty(d){if(!bar)return;bar.classList.toggle('dirty',d);$('#dirtyT').textContent=d?'Unsaved changes':'No changes';}
+document.querySelectorAll('form[data-ajax]').forEach(function(f){
+f.addEventListener('input',function(){dirty(true)});f.addEventListener('change',function(){dirty(true)});
+f.addEventListener('submit',function(e){e.preventDefault();var b=f.querySelector('button[type=submit]');
+btn(b,'busy',f.dataset.busy||'Saving...');toast('Sending to device...','wait');
+fetch(f.action,{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:new URLSearchParams(new FormData(f))})
+.then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t);
+btn(b,'ok','Saved');dirty(false);
+if(f.dataset.after==='wizard'){toast(t,'ok');}else{toast('Saved. Device is reconnecting...','wait');waitOnline();}});})
+.catch(function(x){btn(b,'err','Failed');toast(String(x.message||'Request failed'),'err');});});});
+document.querySelectorAll('form:not([data-ajax])').forEach(function(f){f.addEventListener('submit',function(){
+var b=f.querySelector('button[type=submit]');if(b)setTimeout(function(){btn(b,'busy',f.dataset.busy||'Working...')},0);});});
+document.querySelectorAll('[data-post]').forEach(function(b){b.addEventListener('click',function(){
+btn(b,'busy',b.dataset.busy||'Working...');
+fetch(b.dataset.post,{method:'POST'}).then(function(r){return r.text().then(function(t){if(!r.ok)throw new Error(t);btn(b,'ok',b.dataset.ok||'Done');toast(t,'ok');});})
+.catch(function(x){btn(b,'err','Failed');toast(String(x.message||x),'err');});});});
+addEventListener('pageshow',function(e){if(e.persisted)location.reload();});
+)JS";
+
+static const char kWifiJs[] = R"JS(
+(function(){
+var $i=function(i){return document.getElementById(i)};
+var scan=$i('wifiScanBtn'),res=$i('wifiScanResults'),cb=$i('wifiConnectBtn'),ss=$i('wifiScanStatus'),cs=$i('wifiConnectStatus');
+var ssid=document.querySelector("input[name='wifiSsid']"),pw=document.querySelector("input[name='wifiPassword']");
+var st,ct,active=cb,H={'Content-Type':'application/x-www-form-urlencoded'};
+function poll(){fetch('/wifi-scan/result').then(function(r){return r.json()}).then(function(d){
+if(d.status==='scanning')return;clearInterval(st);
+if(d.status==='done'&&d.networks&&d.networks.length){
+ss.textContent='Pick a network from the list.';res.innerHTML='';
+var ph=new Option('Select a network...','',true,true);ph.disabled=true;res.add(ph);
+d.networks.forEach(function(n){res.add(new Option(n.ssid+' ('+n.rssi+' dBm'+(n.secure?'':', open')+')',n.ssid));});
+res.hidden=false;btn(scan,'ok','Found '+d.networks.length);
+}else if(d.status==='done'){ss.textContent='No networks found.';res.hidden=true;btn(scan,'err','None found');}
+else{ss.textContent='Scan failed.';res.hidden=true;btn(scan,'err','Scan failed');}
+}).catch(function(){clearInterval(st);btn(scan,'err','Scan failed');});}
+scan.onclick=function(){btn(scan,'busy','Scanning...');ss.textContent='';res.hidden=true;cb.hidden=true;cs.textContent='';
+fetch('/wifi-scan/start',{method:'POST'}).then(function(){clearInterval(st);st=setInterval(poll,800);}).catch(function(){btn(scan,'err','Failed');});};
+res.onchange=function(){if(!res.value)return;ssid.value=res.value;cb.hidden=false;cs.textContent='';pw.focus();ssid.dispatchEvent(new Event('input',{bubbles:true}));};
+function pc(label){fetch('/wifi-scan/connect-result').then(function(r){return r.json()}).then(function(d){
+if(d.status==='connecting'){cs.textContent='Connecting to '+label+'...';return;}
+clearInterval(ct);
+if(d.status==='connected'){cs.textContent='Connected. IP '+d.ip;btn(active,'ok','Connected');toast('Connected to '+label,'ok');status();}
+else{cs.textContent='Could not connect. Check the password and try again.';btn(active,'err','Failed');}
+}).catch(function(){clearInterval(ct);btn(active,'err','Check failed');});}
+function go(b,label,url,body){active=b;btn(b,'busy','Connecting...');cs.textContent='Connecting to '+label+'...';
+fetch(url,{method:'POST',headers:H,body:body}).then(function(){clearInterval(ct);ct=setInterval(function(){pc(label)},1000);}).catch(function(){btn(b,'err','Failed');});}
+cb.onclick=function(){if(ssid.value)go(cb,ssid.value,'/wifi-scan/connect','ssid='+encodeURIComponent(ssid.value)+'&password='+encodeURIComponent(pw.value));};
+document.querySelectorAll('.savedWifiConnectBtn').forEach(function(b){b.onclick=function(){var s=b.getAttribute('data-ssid');go(b,s,'/wifi-scan/connect-saved','ssid='+encodeURIComponent(s));};});
+document.querySelectorAll('.savedWifiForgetBtn').forEach(function(b){b.onclick=function(){btn(b,'busy','...');
+fetch('/wifi-forget',{method:'POST',headers:H,body:'ssid='+encodeURIComponent(b.getAttribute('data-ssid'))}).then(function(){location.reload();}).catch(function(){btn(b,'err','Failed');});};});
+})();
+)JS";
+
+static const char kFwJs[] = R"JS(
+(function(){
+var f=document.getElementById('fwFile'),b=document.getElementById('fwBtn'),p=document.getElementById('fwProg');
+b.dataset.l='Upload & reboot';
+f.onchange=function(){if(f.files.length){b.disabled=false;b.textContent='Upload & reboot';}else{b.disabled=true;b.textContent='Choose a .bin file';}};
+document.getElementById('fw').onsubmit=function(e){e.preventDefault();if(!f.files.length)return;
+var x=new XMLHttpRequest(),d=new FormData();d.append('firmware',f.files[0]);
+p.hidden=false;p.value=0;f.disabled=true;btn(b,'busy','Uploading 0%');toast('Uploading firmware. Keep this page open.','wait');
+x.open('POST','/update');
+x.upload.onprogress=function(ev){if(ev.lengthComputable){var n=Math.round(ev.loaded*100/ev.total);p.value=n;btn(b,'busy','Uploading '+n+'%');}};
+x.onload=function(){var t=x.responseText||'',m=/Update failed: ([^<]*)/.exec(t);
+if(m||x.status!==200){p.hidden=true;f.disabled=false;btn(b,'err','Update failed');toast(m?m[1]:'Update failed','err');return;}
+btn(b,'busy','Rebooting...');toast('Update applied. Waiting for the device to come back...','wait');setTimeout(function(){waitOnline();},3000);};
+x.onerror=function(){p.hidden=true;f.disabled=false;btn(b,'err','Connection lost');toast('Connection lost during upload. Nothing was changed unless the device rebooted.','err');};
+x.send(d);};
+})();
+)JS";
+
+static const char kLogJs[] = R"JS(
+(function(){
+var since=0,el=$('#log'),as=$('#autoscroll'),ar=$('#autorefresh'),lvl=$('#lvl');
+function fmt(ms){var s=Math.floor(ms/1000),p=function(n){return String(n).padStart(2,'0')};return '['+p(Math.floor(s/3600))+':'+p(Math.floor(s%3600/60))+':'+p(s%60)+']';}
+async function poll(){
+if(!ar.checked){pill('live','wait','Paused');setTimeout(poll,1500);return;}
+try{var r=await fetch('/logs.json?since='+since,{cache:'no-store'}),d=await r.json();pill('live','ok','Live');
+for(var e of d.entries){since=Math.max(since,e.seq);var l=document.createElement('div');l.className='lvl-'+e.level;l.textContent=fmt(e.ms)+' '+e.level+' '+e.msg;el.appendChild(l);}
+while(el.childNodes.length>300)el.removeChild(el.firstChild);
+if(d.entries.length&&as.checked)el.scrollTop=el.scrollHeight;
+}catch(x){pill('live','bad','Offline');}
+setTimeout(poll,1500);}
+poll();
+var H={'Content-Type':'application/x-www-form-urlencoded'};
+lvl.onchange=function(){lvl.disabled=true;toast('Setting log level...','wait');
+fetch('/logs/level',{method:'POST',headers:H,body:'level='+encodeURIComponent(lvl.value)}).then(function(){toast('Log level: '+lvl.value,'ok');}).catch(function(){toast('Could not set log level','err');}).then(function(){lvl.disabled=false;});};
+var c=$('#clearBtn');c.onclick=function(){btn(c,'busy','Clearing...');
+fetch('/logs/clear',{method:'POST'}).then(function(){el.textContent='';btn(c,'ok','Cleared');}).catch(function(){btn(c,'err','Failed');});};
+})();
+)JS";
+
+// "ready" / "missing" for a USB-host printer, "n/a" when the transport has
+// no way to tell (network/serial -- those only fail at send time).
+static String printerState() {
+  if (cfg.printerMethod == "usb_host") return usbHostTargetReady() ? "ready" : "missing";
+  return "n/a";
+}
+
+static String pillHtml(const char* id, const char* cls, const String& text) {
+  return String("<span class='pill ") + cls + "' id='p-" + id + "'><i></i><span>" + text + "</span></span>";
+}
+
+static String statusPillsHtml() {
+  String h = "<div class='pills'>";
+  if (wifiIsConnected()) h += pillHtml("wifi", "ok", "Wi-Fi " + WiFi.localIP().toString());
+  else if (wifiApModeActive()) h += pillHtml("wifi", "wait", "Setup AP");
+  else h += pillHtml("wifi", "bad", "Wi-Fi off");
+  h += pillHtml("mqtt", mqttIsConnected() ? "ok" : "bad", mqttIsConnected() ? "MQTT on" : "MQTT off");
+  const String ps = printerState();
+  if (ps == "ready") h += pillHtml("prn", "ok", "Printer ready");
+  else if (ps == "missing") h += pillHtml("prn", "bad", "No printer");
+  else h += pillHtml("prn", "wait", "Printer: " + String(targetMethodName()));
+  h += "</div>";
+  return h;
+}
+
+static String navLink(const char* href, const char* label, bool on) {
+  return String("<a href='") + href + "'" + (on ? " class='on'" : "") + ">" + label + "</a>";
+}
+
+// active: "config" | "firmware" | "logs" | "" (no nav, e.g. setup wizard)
+static String pageStart(const char* title, const char* active, bool nav) {
+  String h;
+  h.reserve(20000);
+  h += "<!doctype html><html lang='en'><head><meta charset='utf-8'>";
+  h += "<meta name='viewport' content='width=device-width,initial-scale=1'><meta name='theme-color' content='#0f172a'>";
+  h += "<title>Stikka - ";
+  h += title;
+  h += "</title><style>";
+  h += kCss;
+  h += "</style></head><body><header><div class='top'><b>Stikka bridge</b><span>";
+  h += htmlEscape(cfg.printerName);
+  h += "</span></div>";
+  if (nav) {
+    h += "<nav>";
+    h += navLink("/", "Config", String(active) == "config");
+    h += navLink("/firmware", "Firmware", String(active) == "firmware");
+    h += navLink("/logs", "Logs", String(active) == "logs");
+    h += "</nav>";
+  }
+  h += statusPillsHtml();
+  h += "</header><main>";
+  return h;
+}
+
+static void pageEnd(String& h, const char* extraJs) {
+  h += "</main><div id='toast' role='status' aria-live='polite'></div><script>";
+  h += kJs;
+  h += "</script>";
+  if (extraJs != nullptr) {
+    h += "<script>";
+    h += extraJs;
+    h += "</script>";
+  }
+  h += "</body></html>";
+}
+
+static String cardOpen(const char* cls, const char* title) {
+  return String("<section class='card ") + cls + "'><h2>" + title + "</h2>";
+}
+
+static String fieldHtml(const char* label, const char* name, const String& value, const char* type = "text", const char* extra = "") {
+  return String("<label>") + label + "<input type='" + type + "' name='" + name + "' value='" + htmlEscape(value) + "' " + extra + "></label>";
+}
+
+static String checkHtml(const char* label, const char* name, bool checked) {
+  return String("<label class='chk'><input type='checkbox' name='") + name + "'" + (checked ? " checked" : "") + "><span>" + label + "</span></label>";
+}
+
+static String saveBarHtml(const char* label) {
+  return String("<div class='bar'><div><span class='dirty-t' id='dirtyT'>No changes</span><button type='submit' class='btn'>") + label + "</button></div></div>";
+}
+
+static String kvHtml(const char* k, const String& v) {
+  return String("<div class='kv'><span>") + k + "</span><b>" + v + "</b></div>";
+}
+
 // The single <select> for choosing printer type (-> cfg.printerProtocol +
 // cfg.printerMethod together), shared between renderWizardPage() (first
-// boot) and the "Printer type" box on renderConfigPage() (changing it later,
-// see handleChangeProtocol()) -- both post the same 'printerType' field.
+// boot) and the "Change printer type" box on renderConfigPage() (changing it
+// later, see handleChangeProtocol()) -- both post the same 'printerType' field.
 static String printerTypeFieldHtml() {
   size_t selectedIdx = 0;  // default to the first option (zpl/network) when unset or not one of the options above
   for (size_t i = 0; i < kPrinterTypeOptionCount; i++) {
@@ -103,443 +371,249 @@ static String printerTypeFieldHtml() {
   return html;
 }
 
-// Up to MAX_SAVED_WIFI_NETWORKS entries remembered via rememberWifiNetwork()
-// (populated by the scan Connect button and by both Save forms -- see
-// handleWizardSave()/handleSave()/handleWifiScanConnect() above). Each row's
-// own "Connect" POSTs just the ssid to /wifi-scan/connect-saved, which looks
-// the password up server-side, so a saved password never has to appear in
-// the page again. "Forget" POSTs just the ssid to /wifi-forget via fetch()
-// and reloads the page (it can't be a nested <form>, see below).
+// Saved networks (up to MAX_SAVED_WIFI_NETWORKS, see rememberWifiNetwork()).
+// Connect posts just the ssid to /wifi-scan/connect-saved (password is looked
+// up server-side); Forget posts the ssid to /wifi-forget. Both are
+// script-driven type='button's (see kWifiJs) -- NOT nested <form>s, which
+// HTML forbids inside the page's big /save (or /setup) <form>: the browser
+// closes the outer form at the first inner </form> and the real Save button
+// ends up outside any form. And not submit buttons, so Enter in a text field
+// can't trigger Forget.
 static String savedWifiNetworksHtml() {
   if (cfg.savedWifiNetworkCount <= 0) return String();
-  String html;
-  html += "<div style='margin-top:.75rem;'><small><strong>Saved networks</strong></small>";
+  String html = "<h3>Saved networks</h3>";
   for (int i = 0; i < cfg.savedWifiNetworkCount; i++) {
-    const String& ssid = cfg.savedWifiNetworks[i].ssid;
-    const String escaped = htmlEscape(ssid);
-    html += "<div style='display:flex;align-items:center;gap:.4rem;margin-top:.3rem;'>";
-    html += "<span style='flex:1;font-size:.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;'>" + escaped + "</span>";
-    html += "<button type='button' class='savedWifiConnectBtn' data-ssid='" + escaped + "' style='width:auto;margin-top:0;padding:.25rem .6rem;'>Connect</button>";
-    // A script-driven type='button' (see wifiScanScriptTag()), not a nested
-    // <form>: this list is rendered inside the page's big /save (or /setup)
-    // <form>, and HTML forbids nested forms -- the browser closes the outer
-    // form at the first inner </form>, leaving the real Save button (and
-    // every field after the Wi-Fi box) outside any form, so Save silently did
-    // nothing whenever a saved network existed. It must not be a submit
-    // button either: Enter in any text field would then trigger the first
-    // Forget button instead of Save.
-    html += "<button type='button' class='savedWifiForgetBtn' data-ssid='" + escaped + "' style='width:auto;margin-top:0;padding:.25rem .6rem;'>Forget</button>";
-    html += "</div>";
+    const String escaped = htmlEscape(cfg.savedWifiNetworks[i].ssid);
+    html += "<div class='net'><span>" + escaped + "</span>";
+    html += "<button type='button' class='btn sm savedWifiConnectBtn' data-ssid='" + escaped + "'>Connect</button>";
+    html += "<button type='button' class='btn sm ghost red savedWifiForgetBtn' data-ssid='" + escaped + "'>Forget</button></div>";
   }
-  html += "</div>";
   return html;
 }
 
-// Scan button + status line + results dropdown + Connect button, dropped in
-// next to the SSID field on both renderWizardPage() and renderConfigPage(),
-// followed by the saved-networks list above. Targets the nearest
-// input[name='wifiSsid']/[name='wifiPassword'] on the page rather than an
-// id, since both pages already use those same field names and this markup
-// is identical on both -- see wifiScanScriptTag() below for the
-// polling/connect logic.
-static String wifiScanWidgetHtml() {
-  String html;
-  html += "<button type='button' id='wifiScanBtn' style='width:auto;margin-top:.5rem;'>Scan for networks</button>";
-  html += "<div id='wifiScanStatus' style='margin-top:.35rem;font-size:.85rem;color:#666;'></div>";
-  html += "<select id='wifiScanResults' style='display:none;'></select>";
-  html += "<button type='button' id='wifiConnectBtn' style='width:auto;margin-top:.5rem;display:none;'>Connect</button>";
-  html += "<div id='wifiConnectStatus' style='margin-top:.35rem;font-size:.85rem;color:#666;'></div>";
-  html += savedWifiNetworksHtml();
-  return html;
+// Wi-Fi card shared by wizard + config: SSID, password, scan/connect
+// controls and saved list. kWifiJs finds the inputs by name.
+static String wifiCardHtml(bool requireSsid) {
+  String h = cardOpen("wifi", "Wi-Fi");
+  h += fieldHtml("Network name (SSID)", "wifiSsid", cfg.wifiSsid, "text", requireSsid ? "autocapitalize='none' required" : "autocapitalize='none'");
+  h += fieldHtml("Password", "wifiPassword", cfg.wifiPassword, "password", "autocomplete='off'");
+  h += "<div class='row'><button type='button' id='wifiScanBtn' class='btn sm ghost'>Scan for networks</button></div>";
+  h += "<select id='wifiScanResults' hidden></select>";
+  h += "<div class='row'><button type='button' id='wifiConnectBtn' class='btn sm' hidden>Connect now</button></div>";
+  h += "<small id='wifiScanStatus'></small><small id='wifiConnectStatus'></small>";
+  h += savedWifiNetworksHtml();
+  h += "</section>";
+  return h;
 }
 
-// POST /wifi-scan/start kicks off an async scan; this polls GET
-// /wifi-scan/result (wifiScanResultJson() in wifi_manager.cpp) every 800ms
-// until it settles, then fills #wifiScanResults. Picking an option copies
-// its SSID into the nearest wifiSsid text input and reveals the Connect
-// button, which POSTs the current SSID+password to /wifi-scan/connect
-// (wifiConnectTo()) and polls /wifi-scan/connect-result until the device
-// reports connected/failed. Each saved-network row's own Connect button
-// (savedWifiNetworksHtml()) runs the same connect-result polling loop via
-// startConnect()/pollConnect(), but posts to /wifi-scan/connect-saved with
-// just the ssid, since the password is already known server-side. All of
-// this is independent of the page's own Save/"Save and continue" button --
-// Connect only touches Wi-Fi credentials, so trying a network doesn't
-// require (or risk) resubmitting the rest of the form.
-static String wifiScanScriptTag() {
-  String html;
-  html += "<script>(function(){";
-  html += "var btn=document.getElementById('wifiScanBtn');";
-  html += "var status=document.getElementById('wifiScanStatus');";
-  html += "var sel=document.getElementById('wifiScanResults');";
-  html += "var ssidInput=document.querySelector(\"input[name='wifiSsid']\");";
-  html += "var passwordInput=document.querySelector(\"input[name='wifiPassword']\");";
-  html += "var connectBtn=document.getElementById('wifiConnectBtn');";
-  html += "var connectStatus=document.getElementById('wifiConnectStatus');";
-  html += "var timer=null;";
-  html += "var connectTimer=null;";
-  html += "var activeConnectBtn=connectBtn;";
-  html += "function poll(){";
-  html += "fetch('/wifi-scan/result').then(function(r){return r.json();}).then(function(data){";
-  html += "if(data.status==='scanning'){status.textContent='Scanning...';return;}";
-  html += "clearInterval(timer);btn.disabled=false;";
-  html += "if(data.status==='done'&&data.networks&&data.networks.length){";
-  html += "status.textContent='Found '+data.networks.length+' network(s).';";
-  html += "sel.innerHTML='';";
-  html += "var ph=document.createElement('option');";
-  html += "ph.value='';ph.textContent='Select a network...';ph.disabled=true;ph.selected=true;";
-  html += "sel.appendChild(ph);";
-  html += "data.networks.forEach(function(net){";
-  html += "var opt=document.createElement('option');";
-  html += "opt.value=net.ssid;";
-  html += "opt.textContent=net.ssid+' ('+net.rssi+' dBm'+(net.secure?'':', open')+')';";
-  html += "sel.appendChild(opt);});";
-  html += "sel.style.display='';";
-  html += "}else if(data.status==='done'){status.textContent='No networks found.';sel.style.display='none';}";
-  html += "else{status.textContent='Scan failed.';sel.style.display='none';}";
-  html += "}).catch(function(){clearInterval(timer);btn.disabled=false;status.textContent='Scan failed.';});";
-  html += "}";
-  html += "btn.addEventListener('click',function(){";
-  html += "btn.disabled=true;status.textContent='Scanning...';sel.style.display='none';";
-  html += "connectBtn.style.display='none';connectStatus.textContent='';";
-  html += "fetch('/wifi-scan/start',{method:'POST'}).then(function(){timer=setInterval(poll,800);});";
-  html += "});";
-  html += "sel.addEventListener('change',function(){";
-  html += "if(!sel.value)return;";
-  html += "ssidInput.value=sel.value;connectBtn.style.display='';connectStatus.textContent='';";
-  html += "passwordInput.focus();";
-  html += "});";
-  html += "function pollConnect(label){";
-  html += "fetch('/wifi-scan/connect-result').then(function(r){return r.json();}).then(function(data){";
-  html += "if(data.status==='connecting'){connectStatus.textContent='Connecting to '+label+'...';return;}";
-  html += "clearInterval(connectTimer);activeConnectBtn.disabled=false;";
-  html += "if(data.status==='connected'){connectStatus.textContent='Connected! IP: '+data.ip;}";
-  html += "else{connectStatus.textContent='Could not connect -- check the password and try again.';}";
-  html += "}).catch(function(){clearInterval(connectTimer);activeConnectBtn.disabled=false;connectStatus.textContent='Connect check failed.';});";
-  html += "}";
-  html += "function startConnect(btn,ssid,password){";
-  html += "activeConnectBtn=btn;btn.disabled=true;connectStatus.textContent='Connecting...';";
-  html += "var body='ssid='+encodeURIComponent(ssid)+'&password='+encodeURIComponent(password);";
-  html += "fetch('/wifi-scan/connect',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})";
-  html += ".then(function(){clearInterval(connectTimer);connectTimer=setInterval(function(){pollConnect(ssid);},1000);pollConnect(ssid);})";
-  html += ".catch(function(){btn.disabled=false;connectStatus.textContent='Connect request failed.';});";
-  html += "}";
-  html += "connectBtn.addEventListener('click',function(){";
-  html += "if(!ssidInput.value)return;";
-  html += "startConnect(connectBtn,ssidInput.value,passwordInput.value);";
-  html += "});";
-  html += "document.querySelectorAll('.savedWifiConnectBtn').forEach(function(b){";
-  html += "b.addEventListener('click',function(){";
-  html += "var ssid=b.getAttribute('data-ssid');";
-  html += "activeConnectBtn=b;b.disabled=true;connectStatus.textContent='Connecting to '+ssid+' (saved password)...';";
-  html += "fetch('/wifi-scan/connect-saved',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(ssid)})";
-  html += ".then(function(){clearInterval(connectTimer);connectTimer=setInterval(function(){pollConnect(ssid);},1000);pollConnect(ssid);})";
-  html += ".catch(function(){b.disabled=false;connectStatus.textContent='Connect request failed.';});";
-  html += "});";
-  html += "});";
-  html += "document.querySelectorAll('.savedWifiForgetBtn').forEach(function(b){";
-  html += "b.addEventListener('click',function(){";
-  html += "b.disabled=true;";
-  html += "fetch('/wifi-forget',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:'ssid='+encodeURIComponent(b.getAttribute('data-ssid'))})";
-  html += ".then(function(){location.reload();})";
-  html += ".catch(function(){b.disabled=false;});";
-  html += "});";
-  html += "});";
-  html += "})();</script>";
-  return html;
+static String mqttCardHtml(bool full) {
+  String h = cardOpen("mqtt", "MQTT broker");
+  h += fieldHtml("Broker host", "mqttHost", cfg.mqttHost);
+  h += "<small>Host only (no ws:// or wss://), e.g. your-cluster.s2.eu.hivemq.cloud</small>";
+  h += fieldHtml("Broker port", "mqttPort", String(cfg.mqttPort), "text", "inputmode='numeric'");
+  h += checkHtml("Use TLS (HiveMQ Cloud: on, port 8883)", "mqttUseTls", cfg.mqttUseTls);
+  h += checkHtml("TLS insecure mode (skip certificate validation)", "mqttTlsInsecure", cfg.mqttTlsInsecure);
+  if (full) {
+    h += "<label>CA certificate PEM (optional)<textarea name='mqttCaCert' rows='5'>" + htmlEscape(cfg.mqttCaCert) + "</textarea></label>";
+  }
+  h += fieldHtml("User", "mqttUser", cfg.mqttUser, "text", "autocapitalize='none' autocomplete='off'");
+  h += fieldHtml("Password", "mqttPassword", cfg.mqttPassword, "password", "autocomplete='off'");
+  if (full) {
+    h += fieldHtml("Status publish interval (seconds)", "statusIntervalSec", String(cfg.statusIntervalSec), "text", "inputmode='numeric'");
+  }
+  h += "</section>";
+  return h;
 }
 
 // Minimal first-boot form: Wi-Fi + MQTT + printer brand/method only. Shown
 // instead of renderConfigPage() (see handleRoot()) until setupWizardComplete()
 // is true -- once saved via POST /setup, later visits go straight to the
-// full form, which now shows brand/method-specific fields at runtime instead
-// of gating them at compile time.
+// full form.
 static String renderWizardPage() {
-  String html;
-  html.reserve(3000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Stikka ESP32 - Setup</title><style>";
-  html += "body{font-family:Arial,sans-serif;max-width:480px;margin:1rem auto;padding:0 1rem;}";
-  html += "h1{margin-bottom:.25rem;} .sub{color:#555;margin-top:0;margin-bottom:1rem;}";
-  html += "label{display:block;font-weight:600;margin-top:.75rem;} input,select{width:100%;padding:.5rem;margin-top:.25rem;}";
-  html += "button{margin-top:1.5rem;padding:.6rem 1rem;width:100%;} .box{border:1px solid #ddd;border-radius:8px;padding:1rem;margin-bottom:1rem;}";
-  html += "small{color:#666;}";
-  html += "</style></head><body>";
-  html += "<h1>Stikka ESP32 Setup</h1>";
-  html += "<p class='sub'>Step 1 of 2 &mdash; connect this bridge to your network and tell it what kind of printer it's driving. Label size, target address and other details come next.</p>";
-
-  html += "<form method='POST' action='/setup'>";
-  html += "<div class='box'><h3>Wi-Fi</h3>";
-  html += "<label>SSID<input name='wifiSsid' value='" + htmlEscape(cfg.wifiSsid) + "' required></label>";
-  html += wifiScanWidgetHtml();
-  html += "<label>Password<input type='password' name='wifiPassword' value='" + htmlEscape(cfg.wifiPassword) + "'></label>";
-  html += "</div>";
-
-  html += "<div class='box'><h3>MQTT broker</h3>";
-  html += "<label>Broker host<input name='mqttHost' value='" + htmlEscape(cfg.mqttHost) + "'></label>";
-  html += "<label>Broker port<input name='mqttPort' value='" + String(cfg.mqttPort) + "'></label>";
-  html += "<label><input type='checkbox' name='mqttUseTls' ";
-  if (cfg.mqttUseTls) html += "checked";
-  html += "> Use TLS (HiveMQ Cloud: on, port 8883)</label>";
-  html += "<label><input type='checkbox' name='mqttTlsInsecure' ";
-  if (cfg.mqttTlsInsecure) html += "checked";
-  html += "> TLS insecure mode (skip certificate validation)</label>";
-  html += "<label>User<input name='mqttUser' value='" + htmlEscape(cfg.mqttUser) + "'></label>";
-  html += "<label>Password<input type='password' name='mqttPassword' value='" + htmlEscape(cfg.mqttPassword) + "'></label>";
-  html += "<small>Host only (no ws:// or wss://). Example: your-cluster.s2.eu.hivemq.cloud</small>";
-  html += "</div>";
-
-  html += "<div class='box'><h3>Printer</h3>";
-  html += "<label>Printer name<input name='printerName' value='" + htmlEscape(cfg.printerName) + "'></label>";
-  html += "<small>Becomes the MQTT topic (/&lt;printer name&gt;/status/, /&lt;printer name&gt;/command/), so it must be unique per bridge.</small>";
+  String html = pageStart("Setup", "", false);
+  html += "<h1>Setup</h1>";
+  html += "<p class='sub'>Step 1 of 2 &mdash; connect this bridge to your network and choose its printer. Label size and other details come next.</p>";
+  html += "<form method='POST' action='/setup' data-ajax data-after='wizard' data-busy='Saving...'>";
+  html += wifiCardHtml(true);
+  html += mqttCardHtml(false);
+  html += cardOpen("prn", "Printer");
+  html += fieldHtml("Printer name", "printerName", cfg.printerName, "text", "autocapitalize='none'");
+  html += "<small>Becomes the MQTT topic (/&lt;printer name&gt;/status/ and /command/), so it must be unique per bridge.</small>";
   html += printerTypeFieldHtml();
-  html += "</div>";
-
-  html += "<button type='submit'>Save and continue</button>";
+  html += "</section>";
+  html += saveBarHtml("Save and continue");
   html += "</form>";
-  html += wifiScanScriptTag();
-  html += "</body></html>";
+  pageEnd(html, kWifiJs);
   return html;
 }
 
 static String renderConfigPage() {
-  String html;
-  html.reserve(9000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Stikka ESP32</title><style>";
-  html += "body{font-family:Arial,sans-serif;max-width:1400px;margin:1rem auto;padding:0 1rem;}";
-  html += "h1{margin-bottom:.25rem;} .sub{color:#555;margin-top:0;margin-bottom:1rem;}";
-  html += "label{display:block;font-weight:600;margin-top:.75rem;} input{width:100%;padding:.5rem;margin-top:.25rem;}";
-  html += "button{margin-top:1rem;padding:.6rem 1rem;} .grid{column-width:320px;column-gap:1rem;}";
-  html += ".box{border:1px solid #ddd;border-radius:8px;padding:1rem;margin-bottom:1rem;break-inside:avoid;}";
-  html += "small{color:#666;} code{background:#f3f3f3;padding:.1rem .3rem;border-radius:3px;}";
-  html += "nav{margin-bottom:1rem;} nav a{margin-right:1rem;font-weight:600;text-decoration:none;color:#333;}";
-  html += "</style></head><body>";
-  html += "<nav><a href='/'>Config</a><a href='/firmware'>Firmware</a><a href='/logs'>Logs</a></nav>";
-  html += "<h1>Stikka ESP32 Bridge</h1>";
-  html += "<p class='sub'>Configure Wi-Fi, MQTT and ZPL target for this printer bridge.</p>";
+  String html = pageStart("Config", "config", true);
+  html += "<h1>Bridge settings</h1>";
+  html += "<p class='sub'>Wi-Fi, MQTT and printer settings. Changes apply when you press Save.</p>";
 
-  html += "<div class='box'><strong>Runtime status</strong><br>";
-  html += "Wi-Fi: ";
-  html += wifiIsConnected() ? "connected" : "disconnected";
+  // Device status (read-only snapshot at page load; the header pills stay live).
+  html += cardOpen("dev", "Device");
   if (wifiIsConnected()) {
-    html += " (" + WiFi.localIP().toString() + ")";
+    String w = WiFi.localIP().toString();
     const String mdnsHostname = wifiMdnsHostname();
-    if (!mdnsHostname.isEmpty()) {
-      html += " -- <a href='http://" + mdnsHostname + ".local/'>" + mdnsHostname + ".local</a>";
-    }
-  }
-  html += "<br>MQTT: ";
-  html += mqttIsConnected() ? "connected" : "disconnected";
-  html += "<br>Fallback AP: ";
-  if (wifiApModeActive()) {
-    html += "active (SSID: <code>" + wifiFallbackApSsid() + "</code>, password: <code>" + String(wifiApPassword()) + "</code>)";
-    html += "<br>AP IP: " + WiFi.softAPIP().toString();
+    if (!mdnsHostname.isEmpty()) w += " &middot; <a href='http://" + mdnsHostname + ".local/'>" + mdnsHostname + ".local</a>";
+    html += kvHtml("Wi-Fi", w);
   } else {
-    html += "inactive";
+    html += kvHtml("Wi-Fi", "disconnected");
   }
-  html += "<br>Command topic: <code>" + commandTopic() + "</code>";
-  html += "<br>Status topic: <code>" + statusTopic() + "</code>";
-  html += "</div>";
+  html += kvHtml("MQTT", mqttIsConnected() ? "connected" : "disconnected");
+  if (wifiApModeActive()) {
+    html += kvHtml("Fallback AP", "<code>" + wifiFallbackApSsid() + "</code> / <code>" + String(wifiApPassword()) + "</code> &middot; " + WiFi.softAPIP().toString());
+  } else {
+    html += kvHtml("Fallback AP", "inactive");
+  }
+  html += kvHtml("Command topic", "<code>" + commandTopic() + "</code>");
+  html += kvHtml("Status topic", "<code>" + statusTopic() + "</code>");
+  html += "</section>";
 
-  // Deliberately its own <form>/box, outside the /save form above rather
-  // than folded into the "Wi-Fi & Printer Name" box -- changing brand/method
-  // reboots the device (see handleChangeProtocol()), which is a bigger/rarer
-  // action than a normal settings save and shouldn't be triggerable by
-  // accident from the main Save button.
-  html += "<div class='box'><h3>Printer type</h3>";
-  html += "<form method='POST' action='/reconfigure'>";
-  html += printerTypeFieldHtml();
-  html += "<button type='submit'>Change &amp; reboot</button>";
-  html += "<small>Changing this reboots the device. Method/protocol-specific fields above (target host, QL settings) may need re-filling afterward.</small>";
-  html += "</form>";
-  html += "</div>";
+  // Test print is an action, not a setting: its own button, own states.
+  html += cardOpen("prn", "Test print");
+  html += "<small style='margin:0'>Sends a small test label using the current saved settings.</small>";
+  html += "<button type='button' class='btn teal block' data-post='/test' data-busy='Sending...' data-ok='Test sent'>Send test print</button>";
+  html += "</section>";
 
+  html += "<form method='POST' action='/save' data-ajax data-busy='Saving...'>";
+  html += wifiCardHtml(false);
 
-  html += "<form method='POST' action='/save'>";
-  html += "<div class='grid'>";
-  html += "<div class='box'><h3>Wi-Fi &amp; Printer Name</h3>";
-  html += "<label>SSID<input name='wifiSsid' value='" + htmlEscape(cfg.wifiSsid) + "'></label>";
-  html += wifiScanWidgetHtml();
-  html += "<label>Password<input type='password' name='wifiPassword' value='" + htmlEscape(cfg.wifiPassword) + "'></label>";
-  html += "<label>Printer name<input name='printerName' value='" + htmlEscape(cfg.printerName) + "'></label>";
-  html += "<small>Type: <code>" + cfg.printerProtocol + "</code> · transport: <code>";
-  html += targetMethodName();
-  html += "</code> (see \"Printer type\" below to change) · status topic: /&lt;printername&gt;/status/ · command topic: /&lt;printername&gt;/command/</small>";
-  html += "<label>Details (optional)<input name='location' value='" + htmlEscape(cfg.location) + "'></label>";
+  html += cardOpen("prn", "Printer");
+  html += fieldHtml("Printer name", "printerName", cfg.printerName, "text", "autocapitalize='none'");
+  html += "<small>Type <code>" + cfg.printerProtocol + "</code> via <code>" + String(targetMethodName()) + "</code> (change it at the bottom of this page). Topics: /&lt;printer name&gt;/status/ and /command/.</small>";
+  html += fieldHtml("Details (optional)", "location", cfg.location);
   html += "<small>Shown in the frontend next to this printer's serial number.</small>";
-  html += "</div>";
-
-  html += "<div class='box'><h3>MQTT</h3>";
-  html += "<label>Broker host<input name='mqttHost' value='" + htmlEscape(cfg.mqttHost) + "'></label>";
-  html += "<label>Broker port<input name='mqttPort' value='" + String(cfg.mqttPort) + "'></label>";
-  html += "<label><input type='checkbox' name='mqttUseTls' ";
-  if (cfg.mqttUseTls) html += "checked";
-  html += "> Use TLS (HiveMQ Cloud: on, port 8883)</label>";
-  html += "<label><input type='checkbox' name='mqttTlsInsecure' ";
-  if (cfg.mqttTlsInsecure) html += "checked";
-  html += "> TLS insecure mode (skip certificate validation)</label>";
-  html += "<label>CA certificate PEM (optional)<textarea name='mqttCaCert' rows='6' style='width:100%;margin-top:.25rem;'>" + htmlEscape(cfg.mqttCaCert) + "</textarea></label>";
-  html += "<label>User<input name='mqttUser' value='" + htmlEscape(cfg.mqttUser) + "'></label>";
-  html += "<label>Password<input type='password' name='mqttPassword' value='" + htmlEscape(cfg.mqttPassword) + "'></label>";
-  html += "<label>Status publish interval (seconds)<input name='statusIntervalSec' value='" + String(cfg.statusIntervalSec) + "'></label>";
-  html += "<small>Host only (no ws:// or wss://). Example: your-cluster.s2.eu.hivemq.cloud</small>";
-  html += "</div>";
-
   if (cfg.printerMethod == "network") {
-    html += "<div class='box'><h3>Network target</h3>";
-    html += "<label>Target host<input name='zplTargetHost' value='" + htmlEscape(cfg.zplTargetHost) + "'></label>";
-    html += "<label>Target port<input name='zplTargetPort' value='" + String(cfg.zplTargetPort) + "'></label>";
-    html += "</div>";
+    html += "<h3>Network target</h3>";
+    html += fieldHtml("Target host", "zplTargetHost", cfg.zplTargetHost);
+    html += fieldHtml("Target port", "zplTargetPort", String(cfg.zplTargetPort), "text", "inputmode='numeric'");
   } else if (cfg.printerMethod == "serial") {
-    html += "<div class='box'><h3>Serial target (UART)</h3>";
-    html += "<label>TX pin<input name='printerUartTxPin' value='" + String(cfg.printerUartTxPin) + "'></label>";
-    html += "<label>RX pin<input name='printerUartRxPin' value='" + String(cfg.printerUartRxPin) + "'></label>";
-    html += "<label>Baud rate<input name='printerUartBaud' value='" + String(cfg.printerUartBaud) + "'></label>";
-    html += "<small>A dedicated hardware UART (not the USB/programming port) wired directly to the printer's serial input, 8N1.</small>";
-    html += "</div>";
+    html += "<h3>Serial target (UART)</h3><div class='cols'>";
+    html += fieldHtml("TX pin", "printerUartTxPin", String(cfg.printerUartTxPin), "text", "inputmode='numeric'");
+    html += fieldHtml("RX pin", "printerUartRxPin", String(cfg.printerUartRxPin), "text", "inputmode='numeric'");
+    html += fieldHtml("Baud rate", "printerUartBaud", String(cfg.printerUartBaud), "text", "inputmode='numeric'");
+    html += "</div><small>A dedicated hardware UART (not the USB/programming port) wired to the printer's serial input, 8N1.</small>";
   } else if (cfg.printerMethod == "usb_host") {
-    html += "<div class='box'><h3>USB host target</h3>";
-    html += "<small>This board acts as a real USB host: it automatically enumerates whatever printer is plugged into its native USB port and claims it if it identifies as a USB Printer-class device. Nothing to configure here.</small>";
-    html += "</div>";
+    html += "<h3>USB host target</h3><small>This board acts as a USB host and claims the printer plugged into its native USB port. Nothing to configure here.</small>";
   }
+  html += "</section>";
 
-  html += "<div class='box'><h3>Label</h3>";
-  html += "<label>DPI<input name='dpi' value='" + String(cfg.dpi) + "'></label>";
-  html += "<label>Label width mm<input name='labelWidth' value='" + String(cfg.labelWidth) + "'></label>";
-  html += "<label>Label length mm<input name='labelLength' value='" + String(cfg.labelLength) + "'></label>";
-  html += "<small>0 = endless label (continuous roll, no fixed length).</small>";
+  html += cardOpen("lbl", "Label");
+  html += "<div class='cols'>";
+  html += fieldHtml("DPI", "dpi", String(cfg.dpi), "text", "inputmode='numeric'");
+  html += fieldHtml("Width mm", "labelWidth", String(cfg.labelWidth), "text", "inputmode='numeric'");
+  html += fieldHtml("Length mm", "labelLength", String(cfg.labelLength), "text", "inputmode='numeric'");
+  html += "</div><small>Length 0 = endless label (continuous roll, no fixed length).</small>";
   if (cfg.printerProtocol != "ql" && cfg.printerProtocol != "seiko") {
-    html += "<label><input type='checkbox' name='zplCompressionSupported' ";
-    if (cfg.zplCompressionSupported) html += "checked";
-    html += "> Printer supports compressed graphics (:Z64:/:B64:)</label>";
-    html += "<small>Not every ZPL printer implements this. Only enable if you've confirmed image labels print correctly with it on -- if unsure, leave off.</small>";
+    html += checkHtml("Printer supports compressed graphics (:Z64:/:B64:)", "zplCompressionSupported", cfg.zplCompressionSupported);
+    html += "<small>Not every ZPL printer implements this. Only enable if image labels print correctly with it on; if unsure, leave off.</small>";
   }
-  html += "</div>";
+  html += "</section>";
 
   if (cfg.printerProtocol == "ql") {
-    html += "<div class='box'><h3>Brother QL raster</h3>";
-    html += "<label>Printhead width px (720 = standard family, 1296 = QL-11xx wide)<input name='qlPrintheadPx' value='" + String(cfg.qlPrintheadPx) + "'></label>";
-    html += "<label>Invalidate bytes (200 = most models, 400 = QL-800/810W/820NWB)<input name='qlInvalidateBytes' value='" + String(cfg.qlInvalidateBytes) + "'></label>";
-    html += "<label><input type='checkbox' name='qlAutoCut' ";
-    if (cfg.qlAutoCut) html += "checked";
-    html += "> Auto-cut after each label</label>";
-    html += "<label>Feed margin (dots)<input name='qlFeedMarginDots' value='" + String(cfg.qlFeedMarginDots) + "'></label>";
-    html += "<label>Right margin (dots, 0 = auto-center)<input name='qlRightMarginDots' value='" + String(cfg.qlRightMarginDots) + "'></label>";
-    html += "<small>This firmware doesn't implement Brother's exact per-media offset table, dithering, red/black two-color, 600dpi mode, or reading the printer's status response back -- image jobs are resized to Label width/length above at native 300dpi, thresholded to black/white, and centered (or offset per Right margin). See stikka-esp32/README.md.</small>";
-    html += "</div>";
+    html += cardOpen("lbl", "Brother QL raster");
+    html += fieldHtml("Printhead width px (720 = standard, 1296 = QL-11xx wide)", "qlPrintheadPx", String(cfg.qlPrintheadPx), "text", "inputmode='numeric'");
+    html += fieldHtml("Invalidate bytes (200 = most models, 400 = QL-800/810W/820NWB)", "qlInvalidateBytes", String(cfg.qlInvalidateBytes), "text", "inputmode='numeric'");
+    html += checkHtml("Auto-cut after each label", "qlAutoCut", cfg.qlAutoCut);
+    html += "<div class='cols'>";
+    html += fieldHtml("Feed margin (dots)", "qlFeedMarginDots", String(cfg.qlFeedMarginDots), "text", "inputmode='numeric'");
+    html += fieldHtml("Right margin (dots, 0 = auto-center)", "qlRightMarginDots", String(cfg.qlRightMarginDots), "text", "inputmode='numeric'");
+    html += "</div><small>Image jobs are resized to the label size above at 300dpi, thresholded to black/white and centered. No per-media offset table, dithering, two-color or status read-back. See stikka-esp32/README.md.</small>";
+    html += "</section>";
   }
 
   if (cfg.printerProtocol == "seiko") {
-    html += "<div class='box'><h3>Seiko SLP raster</h3>";
-    html += "<label>Max dots per line (576 = SLP-650)<input name='seikoMaxDots' value='" + String(cfg.seikoMaxDots) + "'></label>";
-    html += "<label>Print density (0-255, 0 = 100%)<input name='seikoDensity' value='" + String(cfg.seikoDensity) + "'></label>";
-    html += "<label>Print speed (0 = draft, 2 = fine/300dpi)<input name='seikoSpeed' value='" + String(cfg.seikoSpeed) + "'></label>";
-    html += "<small>Image jobs are resized to Label width/length above at the DPI set there, thresholded to black/white, and centered on the printhead via the printer's own margin command -- no dithering, no per-model lookup table. See stikka-esp32/README.md.</small>";
-    html += "</div>";
+    html += cardOpen("lbl", "Seiko SLP raster");
+    html += fieldHtml("Max dots per line (576 = SLP-650)", "seikoMaxDots", String(cfg.seikoMaxDots), "text", "inputmode='numeric'");
+    html += fieldHtml("Print density (0-255, 0 = 100%)", "seikoDensity", String(cfg.seikoDensity), "text", "inputmode='numeric'");
+    html += fieldHtml("Print speed (0 = draft, 2 = fine/300dpi)", "seikoSpeed", String(cfg.seikoSpeed), "text", "inputmode='numeric'");
+    html += "<small>Image jobs are resized to the label size above, thresholded to black/white and centered via the printer's margin command. See stikka-esp32/README.md.</small>";
+    html += "</section>";
   }
 
-  html += "<div class='box'><h3>Debug output</h3>";
-  html += "<label><input type='checkbox' name='debugOutput' ";
-  if (cfg.debugOutput) html += "checked";
-  html += "> Enable serial debug output</label>";
-  html += "<small>Always available on this board's programming/USB port (115200 8N1), regardless of printer connection method -- the status LED's mode/pin/color are fixed by the firmware build, not editable here.</small>";
-  html += "</div>";
-  html += "</div>";
+  html += mqttCardHtml(true);
 
-  html += "<button type='submit'>Save and reconnect</button>";
+  html += cardOpen("dev", "Debug output");
+  html += checkHtml("Enable serial debug output", "debugOutput", cfg.debugOutput);
+  html += "<small>Always available on the programming/USB port (115200 8N1). The status LED's mode/pin/color are fixed by the firmware build.</small>";
+  html += "</section>";
+
+  html += saveBarHtml("Save and reconnect");
   html += "</form>";
 
-  html += "<form method='POST' action='/test'><button type='submit'>Send test print</button></form>";
-  html += wifiScanScriptTag();
-  html += "</body></html>";
+  // Rare + disruptive (reboots), so it lives apart from the Save form, in red.
+  html += "<form method='POST' action='/reconfigure' data-busy='Rebooting...'>";
+  html += cardOpen("danger", "Change printer type");
+  html += printerTypeFieldHtml();
+  html += "<small>Reboots the device. Target host and QL/Seiko settings may need re-filling afterwards.</small>";
+  html += "<button type='submit' class='btn red block'>Change &amp; reboot</button>";
+  html += "</section></form>";
 
+  pageEnd(html, kWifiJs);
   return html;
 }
 
 // OTA update over Wi-Fi (see handleOtaUpload()/handleOtaUpdate() below and
 // Update.h) -- same firmware.bin scripts/build-firmware.sh stages for the
 // in-browser USB flasher, just uploaded to the device directly instead of
-// over a cable. Own page (not a box on renderConfigPage()) for the same
-// reason Logs got its own page: it's an occasional admin action, not
-// something that belongs competing for space with day-to-day settings.
+// over a cable.
 static String renderFirmwarePage() {
-  String html;
-  html.reserve(2000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Stikka ESP32 - Firmware</title><style>";
-  html += "body{font-family:Arial,sans-serif;max-width:640px;margin:1rem auto;padding:0 1rem;}";
-  html += "h1{margin-bottom:.25rem;} nav{margin-bottom:1rem;} nav a{margin-right:1rem;font-weight:600;text-decoration:none;color:#333;}";
-  html += "label{display:block;font-weight:600;margin-top:.75rem;} button{margin-top:1rem;padding:.6rem 1rem;width:auto;}";
-  html += ".box{border:1px solid #ddd;border-radius:8px;padding:1rem;margin-bottom:1rem;} small{color:#666;}";
-  html += "code{background:#f3f3f3;padding:.1rem .3rem;border-radius:3px;}";
-  html += "</style></head><body>";
-  html += "<nav><a href='/'>Config</a><a href='/firmware'>Firmware</a><a href='/logs'>Logs</a></nav>";
+  String html = pageStart("Firmware", "firmware", true);
   html += "<h1>Firmware</h1>";
+  html += "<p class='sub'>Update this bridge over Wi-Fi.</p>";
+  html += cardOpen("dev", "Running build");
+  html += kvHtml("Built", __DATE__ " " __TIME__);
+  html += "</section>";
 
-  html += "<div class='box'>";
-  html += "<small>Running build: " __DATE__ " " __TIME__ "</small>";
-  html += "<form method='POST' action='/update' enctype='multipart/form-data' style='margin-top:.5rem;'>";
-  html += "<input type='file' name='firmware' accept='.bin' required>";
-  html += "<button type='submit'>Upload &amp; reboot</button>";
+  html += cardOpen("lbl", "Upload new firmware");
+  html += "<form id='fw'>";
+  html += "<input type='file' id='fwFile' name='firmware' accept='.bin' required>";
+  html += "<progress id='fwProg' max='100' value='0' hidden></progress>";
+  html += "<button type='submit' id='fwBtn' class='btn amber block' disabled>Choose a .bin file</button>";
   html += "</form>";
-  html += "<small>Upload the <code>firmware.bin</code> produced by <code>scripts/build-firmware.sh</code> (staged under <code>frontend/public/firmware/</code> for the browser's USB flasher -- same file, just sent over Wi-Fi here instead of a cable). Not password-protected -- anyone who can reach this page can reflash the device, same as the other settings here.</small>";
-  html += "</div>";
-
-  html += "</body></html>";
+  html += "<small>Upload the <code>firmware.bin</code> from <code>scripts/build-firmware.sh</code> (same file the browser USB flasher uses). The device reboots when done. Not password-protected: anyone who can reach this page can reflash the device.</small>";
+  html += "</section>";
+  pageEnd(html, kFwJs);
   return html;
 }
 
 static String renderLogsPage() {
-  String html;
-  html.reserve(4000);
-  html += "<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>";
-  html += "<title>Stikka ESP32 - Logs</title><style>";
-  html += "body{font-family:Arial,sans-serif;max-width:960px;margin:1rem auto;padding:0 1rem;}";
-  html += "h1{margin-bottom:.25rem;} nav{margin-bottom:1rem;} nav a{margin-right:1rem;font-weight:600;text-decoration:none;color:#333;}";
-  html += "select,button{padding:.4rem .6rem;} .toolbar{display:flex;gap:1rem;align-items:center;flex-wrap:wrap;margin-bottom:1rem;}";
-  html += "#log{border:1px solid #ddd;border-radius:8px;background:#111;color:#ddd;font-family:Consolas,Menlo,monospace;";
-  html += "font-size:.85rem;padding:.75rem;height:60vh;overflow-y:auto;white-space:pre-wrap;word-break:break-word;}";
-  html += ".lvl-ERROR{color:#ff6b6b;} .lvl-WARN{color:#ffd166;} .lvl-INFO{color:#8ecae6;} .lvl-DEBUG{color:#999;}";
-  html += "</style></head><body>";
-  html += "<nav><a href='/'>Config</a><a href='/firmware'>Firmware</a><a href='/logs'>Logs</a></nav>";
-  html += "<h1>Device Logs</h1>";
-
-  html += "<div class='toolbar'>";
-  html += "<form method='POST' action='/logs/level' style='display:inline;'>";
-  html += "<label>Log level ";
-  html += "<select name='level' onchange='this.form.submit()'>";
+  String html = pageStart("Logs", "logs", true);
+  html += "<h1>Device logs</h1>";
+  html += "<div class='tools' style='margin:.6rem 0 .8rem'>";
+  html += "<label>Level <select id='lvl'>";
   static const char* kLevels[] = {"ERROR", "WARN", "INFO", "DEBUG"};
   for (const char* lvl : kLevels) {
     html += "<option value='" + String(lvl) + "'";
     if (String(logLevelName(cfg.logLevel)) == lvl) html += " selected";
     html += ">" + String(lvl) + "</option>";
   }
-  html += "</select></label></form>";
+  html += "</select></label>";
+  html += "<span class='pill lt wait' id='p-live' data-lt='1'><i></i><span>Connecting</span></span>";
   html += "<label><input type='checkbox' id='autoscroll' checked> Auto-scroll</label>";
-  html += "<label><input type='checkbox' id='autorefresh' checked> Auto-refresh</label>";
-  html += "<form method='POST' action='/logs/clear' style='display:inline;'><button type='submit'>Clear</button></form>";
+  html += "<label><input type='checkbox' id='autorefresh' checked> Live</label>";
+  html += "<button type='button' id='clearBtn' class='btn sm red'>Clear</button>";
   html += "</div>";
-
   html += "<div id='log'></div>";
-
-  html += "<script>";
-  html += "let sinceSeq=0;const logEl=document.getElementById('log');";
-  html += "function fmtMs(ms){const s=Math.floor(ms/1000);return '['+String(Math.floor(s/3600)).padStart(2,'0')+':'+String(Math.floor((s%3600)/60)).padStart(2,'0')+':'+String(s%60).padStart(2,'0')+']';}";
-  html += "async function poll(){";
-  html += "try{const res=await fetch('/logs.json?since='+sinceSeq);const data=await res.json();";
-  html += "for(const e of data.entries){sinceSeq=Math.max(sinceSeq,e.seq);";
-  html += "const line=document.createElement('div');line.className='lvl-'+e.level;";
-  html += "line.textContent=fmtMs(e.ms)+' '+e.level+' '+e.msg;logEl.appendChild(line);}";
-  html += "if(data.entries.length && document.getElementById('autoscroll').checked){logEl.scrollTop=logEl.scrollHeight;}";
-  html += "}catch(e){}";
-  html += "setTimeout(poll, document.getElementById('autorefresh').checked?1500:4000);";
-  html += "}";
-  html += "poll();";
-  html += "</script>";
-
-  html += "</body></html>";
+  pageEnd(html, kLogJs);
   return html;
+}
+
+static void handleStatusJson() {
+  String j = "{\"wifi\":";
+  j += wifiIsConnected() ? "true" : "false";
+  j += ",\"ip\":\"" + (wifiIsConnected() ? WiFi.localIP().toString() : String("")) + "\"";
+  j += ",\"ap\":";
+  j += wifiApModeActive() ? "true" : "false";
+  j += ",\"mqtt\":";
+  j += mqttIsConnected() ? "true" : "false";
+  j += ",\"printer\":\"" + printerState() + "\"";
+  j += ",\"method\":\"" + String(targetMethodName()) + "\"}";
+  web.sendHeader("Cache-Control", "no-store");
+  web.send(200, "application/json", j);
 }
 
 static void handleRoot() {
@@ -945,6 +1019,7 @@ void webUiSetup() {
   web.on("/save", HTTP_POST, handleSave);
   web.on("/reconfigure", HTTP_POST, handleChangeProtocol);
   web.on("/firmware", HTTP_GET, handleFirmwarePage);
+  web.on("/status.json", HTTP_GET, handleStatusJson);
   web.on("/update", HTTP_POST, handleOtaUpdate, handleOtaUpload);
   web.on("/wifi-scan/start", HTTP_POST, handleWifiScanStart);
   web.on("/wifi-scan/result", HTTP_GET, handleWifiScanResult);

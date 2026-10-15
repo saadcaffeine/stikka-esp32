@@ -434,3 +434,7 @@ bool usbHostTargetSendString(const String& body, String& err) {
   }
   return usbHostTargetSend(reinterpret_cast<const uint8_t*>(body.c_str()), body.length(), err);
 }
+
+bool usbHostTargetReady() {
+  return printerClaimed && printerOut != nullptr;
+}

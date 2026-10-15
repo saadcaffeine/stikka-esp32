@@ -60,3 +60,7 @@ void usbHostTargetSetup();
 void usbHostTargetLoop();
 bool usbHostTargetSend(const uint8_t* data, size_t len, String& err);
 bool usbHostTargetSendString(const String& body, String& err);
+
+// True once a USB printer has been enumerated and its bulk-OUT endpoint claimed
+// (used by the web UI status pill). Always false for non-usb_host setups.
+bool usbHostTargetReady();
